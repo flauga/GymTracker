@@ -9,6 +9,7 @@ const WorkoutApp = () => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [exercises, setExercises] = useState([]);
+  const [selectedMuscleGroup, setSelectedMuscleGroup] = useState('');
   const [selectedExercise, setSelectedExercise] = useState('');
   const [weight, setWeight] = useState('');
   const [reps, setReps] = useState('');
@@ -1087,11 +1088,22 @@ const WorkoutApp = () => {
                 </div>
                 <form onSubmit={logWorkout} className="space-y-4">
                   <div>
+                    <label className="block text-sm font-semibold text-gray-400 mb-2">Muscle Group</label>
+                    <select value={selectedMuscleGroup} onChange={(e) => { setSelectedMuscleGroup(e.target.value); setSelectedExercise(''); }}
+                      className="w-full px-4 py-2.5 rounded-lg bg-gray-900 border border-gray-700 text-white focus:outline-none focus:border-yellow-500 transition">
+                      <option value="">Select muscle group...</option>
+                      {[...new Set(exercises.map(ex => ex.primary_muscle))].sort().map(mg => (
+                        <option key={mg} value={mg}>{mg.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
                     <label className="block text-sm font-semibold text-gray-400 mb-2">Exercise</label>
                     <select value={selectedExercise} onChange={(e) => setSelectedExercise(e.target.value)}
-                      className="w-full px-4 py-2.5 rounded-lg bg-gray-900 border border-gray-700 text-white focus:outline-none focus:border-yellow-500 transition">
-                      <option value="">Select exercise...</option>
-                      {exercises.map(ex => (
+                      disabled={!selectedMuscleGroup}
+                      className="w-full px-4 py-2.5 rounded-lg bg-gray-900 border border-gray-700 text-white focus:outline-none focus:border-yellow-500 transition disabled:opacity-50">
+                      <option value="">{selectedMuscleGroup ? 'Select exercise...' : 'Select a muscle group first...'}</option>
+                      {exercises.filter(ex => ex.primary_muscle === selectedMuscleGroup).map(ex => (
                         <option key={ex.id} value={ex.id}>{ex.name}</option>
                       ))}
                     </select>

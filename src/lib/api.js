@@ -8,7 +8,7 @@ import { supabase } from './supabase';
 export async function fetchExercises() {
   const { data, error } = await supabase
     .from('exercises')
-    .select('id, name, type, primary_muscles, secondary_muscles')
+    .select('id, name, slug, primary_muscle, secondary_muscles, equipment, movement_pattern, exercise_type, difficulty, is_unilateral')
     .order('name');
   if (error) throw error;
   return data;
