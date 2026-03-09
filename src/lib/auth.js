@@ -2,12 +2,17 @@ import { supabase } from './supabase';
 
 /**
  * Sign up a new user with email and password.
- * Supabase Auth handles bcrypt hashing and JWT tokens automatically.
+ * emailRedirectTo uses the current origin so confirmation links always
+ * point to the deployed app URL (not localhost).
+ * NOTE: Add your Netlify URL to Supabase → Auth → URL Configuration → Redirect URLs.
  */
 export async function signUp(email, password) {
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
+    options: {
+      emailRedirectTo: window.location.origin,
+    },
   });
   if (error) throw error;
   return data;
@@ -34,6 +39,27 @@ export async function signOut() {
 }
 
 /**
+ * Send a password reset email.
+ * The link redirects back to the app (current origin) where the
+ * PASSWORD_RECOVERY auth event is detected and the reset form is shown.
+ */
+export async function sendPasswordReset(email) {
+  const { error } = await supabase.auth.resetPasswordForEmail(email, {
+    redirectTo: window.location.origin,
+  });
+  if (error) throw error;
+}
+
+/**
+ * Update the authenticated user's password (called after PASSWORD_RECOVERY flow).
+ */
+export async function updatePassword(newPassword) {
+  const { data, error } = await supabase.auth.updateUser({ password: newPassword });
+  if (error) throw error;
+  return data;
+}
+
+/**
  * Get the current session (user + access token).
  * Returns null if not logged in.
  */
@@ -44,17 +70,18 @@ export async function getSession() {
 }
 
 /**
- * Subscribe to auth state changes (login, logout, token refresh).
+ * Subscribe to auth state changes (login, logout, token refresh, password recovery).
+ * Callback receives (event, user) so callers can handle PASSWORD_RECOVERY separately.
  * Returns an unsubscribe function.
  *
  * Usage:
- *   const unsub = onAuthChange((user) => setUser(user));
+ *   const unsub = onAuthChange((event, user) => { ... });
  *   // later: unsub();
  */
 export function onAuthChange(callback) {
   const { data: { subscription } } = supabase.auth.onAuthStateChange(
-    (_event, session) => {
-      callback(session?.user ?? null);
+    (event, session) => {
+      callback(event, session?.user ?? null);
     }
   );
   return () => subscription.unsubscribe();

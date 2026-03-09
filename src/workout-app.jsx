@@ -1,13 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { LogOut, Plus, Calendar, Zap, ChevronLeft, ChevronRight, Pencil, Trash2, Check, X, Dumbbell, Upload, Settings, MessageCircle, AlertCircle } from 'lucide-react';
-import { signUp, signIn, signOut, onAuthChange, updateProfile, getProfile } from './lib/auth';
+import { signUp, signIn, signOut, onAuthChange, sendPasswordReset, updatePassword, updateProfile, getProfile } from './lib/auth';
 import * as api from './lib/api';
 
 const WorkoutApp = () => {
-  const [page, setPage] = useState('login'); // login, signup, dashboard
+  const [page, setPage] = useState('login'); // login, signup, forgotPassword, resetPassword, dashboard
   const [user, setUser] = useState(null);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
   const [exercises, setExercises] = useState([]);
   const [selectedMuscleGroup, setSelectedMuscleGroup] = useState('');
   const [selectedExercise, setSelectedExercise] = useState('');
@@ -91,6 +92,33 @@ const WorkoutApp = () => {
       } else {
         setError(err.message || 'Login failed');
       }
+    }
+    setLoading(false);
+  };
+
+  const handleForgotPassword = async (email) => {
+    setLoading(true);
+    setError('');
+    try {
+      await sendPasswordReset(email);
+      setSuccess('Password reset email sent! Check your inbox.');
+      setEmail('');
+    } catch (err) {
+      setError(err.message || 'Failed to send reset email');
+    }
+    setLoading(false);
+  };
+
+  const handleResetPassword = async (newPassword) => {
+    setLoading(true);
+    setError('');
+    try {
+      await updatePassword(newPassword);
+      setSuccess('Password updated! Redirecting to login…');
+      setNewPassword('');
+      setTimeout(() => { setPage('login'); setSuccess(''); }, 2000);
+    } catch (err) {
+      setError(err.message || 'Failed to update password');
     }
     setLoading(false);
   };
@@ -500,8 +528,13 @@ const WorkoutApp = () => {
 
   // Listen to Supabase Auth state changes (replaces localStorage session check)
   useEffect(() => {
-    const unsubscribe = onAuthChange((authUser) => {
-      if (authUser) {
+    const unsubscribe = onAuthChange((event, authUser) => {
+      if (event === 'PASSWORD_RECOVERY') {
+        // User clicked the reset-password link in their email — show the reset form.
+        setError('');
+        setSuccess('');
+        setPage('resetPassword');
+      } else if (authUser) {
         setUser(authUser);
         setPage('dashboard');
       } else {
@@ -566,12 +599,74 @@ const WorkoutApp = () => {
               <button onClick={() => handleLogin(email, password)} disabled={loading} className={btnPrimary}>
                 {loading ? 'Signing in...' : 'Sign In'}
               </button>
-              <div className="mt-6 text-center">
+              <div className="mt-4 text-center">
+                <button onClick={() => { setPage('forgotPassword'); setError(''); setSuccess(''); }} className="text-gray-400 hover:text-gray-300 text-sm transition">
+                  Forgot password?
+                </button>
+              </div>
+              <div className="mt-4 text-center">
                 <p className="text-gray-500 mb-3">Don't have an account?</p>
                 <button onClick={() => { setPage('signup'); setError(''); setSuccess(''); }} className="text-yellow-400 hover:text-yellow-300 font-semibold transition">
                   Create account
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Forgot Password ───────────────────────────── */}
+      {page === 'forgotPassword' && (
+        <div className="flex items-center justify-center min-h-screen px-4">
+          <div className="w-full max-w-md">
+            <div className="text-center mb-8">
+              <div className="flex justify-center mb-4">
+                <Zap className="w-12 h-12 text-yellow-400" />
+              </div>
+              <h1 className="text-4xl font-bold mb-2">Reset Password</h1>
+              <p className="text-gray-400">Enter your email to receive a reset link</p>
+            </div>
+            <div className={cardClass}>
+              <div className="mb-5">
+                <input type="email" placeholder="Email" value={email}
+                  onChange={(e) => setEmail(e.target.value)} className={inputClass} />
+              </div>
+              {error && <div className="mb-4 p-3 bg-red-500 bg-opacity-15 border border-red-600 rounded-lg text-red-300 text-sm">{error}</div>}
+              {success && <div className="mb-4 p-3 bg-green-500 bg-opacity-15 border border-green-600 rounded-lg text-green-300 text-sm">{success}</div>}
+              <button onClick={() => handleForgotPassword(email)} disabled={loading || !!success} className={btnPrimary}>
+                {loading ? 'Sending…' : 'Send Reset Link'}
+              </button>
+              <div className="mt-6 text-center">
+                <button onClick={() => { setPage('login'); setError(''); setSuccess(''); }} className="text-yellow-400 hover:text-yellow-300 font-semibold transition">
+                  Back to login
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Reset Password (after clicking email link) ── */}
+      {page === 'resetPassword' && (
+        <div className="flex items-center justify-center min-h-screen px-4">
+          <div className="w-full max-w-md">
+            <div className="text-center mb-8">
+              <div className="flex justify-center mb-4">
+                <Zap className="w-12 h-12 text-yellow-400" />
+              </div>
+              <h1 className="text-4xl font-bold mb-2">New Password</h1>
+              <p className="text-gray-400">Choose a strong password for your account</p>
+            </div>
+            <div className={cardClass}>
+              <div className="mb-5">
+                <input type="password" placeholder="New password (min 6 characters)" value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)} className={inputClass} />
+              </div>
+              {error && <div className="mb-4 p-3 bg-red-500 bg-opacity-15 border border-red-600 rounded-lg text-red-300 text-sm">{error}</div>}
+              {success && <div className="mb-4 p-3 bg-green-500 bg-opacity-15 border border-green-600 rounded-lg text-green-300 text-sm">{success}</div>}
+              <button onClick={() => handleResetPassword(newPassword)} disabled={loading || !!success} className={btnPrimary}>
+                {loading ? 'Updating…' : 'Update Password'}
+              </button>
             </div>
           </div>
         </div>
