@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { LogOut, Plus, Calendar, Zap, ChevronLeft, ChevronRight, Pencil, Trash2, Check, X, Dumbbell, Upload, Settings, MessageCircle, AlertCircle } from 'lucide-react';
 import { signUp, signIn, signOut, onAuthChange, sendPasswordReset, updatePassword, updateProfile, getProfile } from './lib/auth';
 import * as api from './lib/api';
+import { parseWorkoutWithGemini } from './lib/gemini-parser';
 
 const WorkoutApp = () => {
   const [page, setPage] = useState('login'); // login, signup, forgotPassword, resetPassword, dashboard
@@ -384,15 +385,31 @@ const WorkoutApp = () => {
     setImportParsing(true);
     setError('');
     try {
-      const response = await fetch('/.netlify/functions/parse-workout', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: importText, userEmail: user.email })
+      const exerciseNames = exercises.map(e => e.name);
+      const parsed = await parseWorkoutWithGemini(importText, exerciseNames);
+
+      // Match parsed exercise names to exercise IDs
+      const entries = (parsed.entries || []).map(entry => {
+        if (entry.exercise === 'UNMATCHED') {
+          return { ...entry, exerciseId: null, matched: false };
+        }
+        const exact = exercises.find(e => e.name === entry.exercise);
+        if (exact) {
+          return { ...entry, exerciseId: exact.id, matched: true };
+        }
+        // Fuzzy fallback: case-insensitive partial match
+        const lower = entry.exercise.toLowerCase();
+        const fuzzy = exercises.find(
+          e => e.name.toLowerCase().includes(lower) || lower.includes(e.name.toLowerCase())
+        );
+        if (fuzzy) {
+          return { ...entry, exercise: fuzzy.name, exerciseId: fuzzy.id, matched: true, fuzzyMatch: true };
+        }
+        return { ...entry, exerciseId: null, matched: false };
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Parse failed');
-      setImportParsedEntries(data.entries || []);
-      setImportUnparseable(data.unparseable || []);
+
+      setImportParsedEntries(entries);
+      setImportUnparseable(parsed.unparseable || []);
       setImportStep('preview');
     } catch (err) {
       setError('Failed to parse: ' + err.message);
