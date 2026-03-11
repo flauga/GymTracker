@@ -131,6 +131,41 @@ export async function bulkCreateWorkoutLogs(records) {
   return data;
 }
 
+/**
+ * Fetch the most recent set per exercise for smart defaults.
+ * Returns a map of exerciseId -> { weight, reps }.
+ */
+export async function fetchLastSetsForAllExercises(userId) {
+  const { data, error } = await supabase
+    .from('exercise_logs')
+    .select('exercise_id, weight_kg, reps')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(200);
+  if (error) throw error;
+  const map = {};
+  (data || []).forEach(row => {
+    if (!map[row.exercise_id]) {
+      map[row.exercise_id] = { weight: row.weight_kg, reps: row.reps };
+    }
+  });
+  return map;
+}
+
+/**
+ * Fetch logs within a date range (for weekly summaries).
+ */
+export async function fetchLogsForDateRange(userId, startDate, endDate) {
+  const { data, error } = await supabase
+    .from('exercise_logs')
+    .select('date, weight_kg, reps, exercise_id')
+    .eq('user_id', userId)
+    .gte('date', startDate)
+    .lte('date', endDate);
+  if (error) throw error;
+  return data;
+}
+
 // ─── Workout Templates ──────────────────────────────────────
 
 /**
@@ -229,5 +264,77 @@ export async function deleteTemplate(templateId) {
     .from('workout_templates')
     .delete()
     .eq('id', templateId);
+  if (error) throw error;
+}
+
+// ─── Protein Logs ────────────────────────────────────────────
+
+/**
+ * Fetch protein logs for a specific date.
+ */
+export async function fetchProteinLogsForDate(userId, date) {
+  const { data, error } = await supabase
+    .from('protein_logs')
+    .select('id, description, protein_grams, source_text, created_at')
+    .eq('user_id', userId)
+    .eq('date', date)
+    .order('created_at');
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Fetch all protein log dates for a user (for calendar display).
+ */
+export async function fetchProteinDates(userId) {
+  const { data, error } = await supabase
+    .from('protein_logs')
+    .select('date')
+    .eq('user_id', userId);
+  if (error) throw error;
+  return new Set(data.map(row => row.date));
+}
+
+/**
+ * Bulk-create protein log entries.
+ */
+export async function createProteinLogs(userId, date, entries) {
+  const records = entries.map(e => ({
+    user_id: userId,
+    date,
+    description: e.description,
+    protein_grams: e.protein_grams,
+    source_text: e.source_text || null,
+  }));
+  const { data, error } = await supabase
+    .from('protein_logs')
+    .insert(records)
+    .select();
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Update a protein log entry.
+ */
+export async function updateProteinLog(id, description, proteinGrams) {
+  const { data, error } = await supabase
+    .from('protein_logs')
+    .update({ description, protein_grams: proteinGrams })
+    .eq('id', id)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Delete a protein log entry.
+ */
+export async function deleteProteinLog(id) {
+  const { error } = await supabase
+    .from('protein_logs')
+    .delete()
+    .eq('id', id);
   if (error) throw error;
 }

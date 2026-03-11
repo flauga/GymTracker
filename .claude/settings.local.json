@@ -44,7 +44,16 @@
       "Skill(claude-developer-platform:*)",
       "Bash(git add netlify/functions/shared/openai-parser.js src/App.jsx)",
       "Bash(git push origin master)",
-      "Bash(npm install)"
+      "Bash(npm install)",
+      "Bash(git rm -r --cached node_modules)",
+      "Bash(git add .gitignore)",
+      "Bash(git push origin main)",
+      "Bash(git add src/workout-app.jsx src/index.js)",
+      "Bash(python3 -c \":*)",
+      "Bash(python -c \":*)",
+      "Bash(npx react-scripts build)",
+      "Bash(git add supabase/migrations/002_update_exercises_schema.sql supabase/seed.sql src/lib/api.js src/workout-app.jsx)",
+      "Bash(node -e \"const l = require\\(''./node_modules/lucide-react''\\); console.log\\(Object.keys\\(l\\).filter\\(k => k.toLowerCase\\(\\).includes\\(''slack''\\) || k.toLowerCase\\(\\).includes\\(''hash''\\) || k.toLowerCase\\(\\).includes\\(''message''\\)\\).join\\('', ''\\)\\)\")"
     ]
   }
 }

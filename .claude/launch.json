@@ -4,7 +4,7 @@
     {
       "name": "GymTracker",
       "runtimeExecutable": "cmd",
-      "runtimeArgs": ["/c", "cd /d E:\\GymTrackerApp\\gymtracker && npm start"],
+      "runtimeArgs": ["/c", "cd /d E:\\GymTrackerApp\\files && npm start"],
       "port": 3000
     }
   ]
