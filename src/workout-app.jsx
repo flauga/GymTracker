@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { LogOut, Plus, Calendar, Zap, ChevronLeft, ChevronRight, Pencil, Trash2, Check, X, Dumbbell, Upload, Settings, Hash, Slack, TrendingUp, AlertCircle } from 'lucide-react';
 import { signUp, signIn, signOut, onAuthChange, sendPasswordReset, updatePassword, updateProfile, getProfile } from './lib/auth';
 import * as api from './lib/api';
@@ -90,6 +90,15 @@ const WorkoutApp = () => {
   const [exerciseSearch, setExerciseSearch] = useState('');
   const [showExerciseDropdown, setShowExerciseDropdown] = useState(false);
 
+  // Template exercise search state
+  const [templateExerciseSearch, setTemplateExerciseSearch] = useState('');
+  const [showTemplateExerciseDropdown, setShowTemplateExerciseDropdown] = useState(false);
+
+  // Add new exercise state
+  const [showAddExercise, setShowAddExercise] = useState(false);
+  const [newExerciseName, setNewExerciseName] = useState('');
+  const [newExerciseMuscle, setNewExerciseMuscle] = useState('');
+
   // Streak
   const [streak, setStreak] = useState(0);
 
@@ -102,6 +111,13 @@ const WorkoutApp = () => {
   const [prMap, setPrMap] = useState({});
   const [prCelebration, setPrCelebration] = useState(null);
 
+  // Overload cache for performance
+  const overloadCacheRef = useRef(null);
+  const overloadDebounceRef = useRef(null);
+
+  // Active workout sets tracking
+  const [activeWorkoutSetsLogged, setActiveWorkoutSetsLogged] = useState({});
+
   // Weekly summary
   const [weeklySummary, setWeeklySummary] = useState(null);
 
@@ -113,6 +129,19 @@ const WorkoutApp = () => {
 
   // Mobile panel tab
   const [mobilePanelTab, setMobilePanelTab] = useState('calendar');
+
+  // Double progression recommendations
+  const [doubleProgressionRecs, setDoubleProgressionRecs] = useState({});
+  const DOUBLE_PROGRESSION_THRESHOLD = 16;
+
+  // Weight stacks for AMRAP equivalence
+  const [weightStacks, setWeightStacks] = useState({});
+  const [weightCalcExpanded, setWeightCalcExpanded] = useState(false);
+  const [weightStackExerciseSearch, setWeightStackExerciseSearch] = useState('');
+  const [weightStackInput, setWeightStackInput] = useState('');
+
+  // Template progression expansion
+  const [expandedTemplateId, setExpandedTemplateId] = useState(null);
 
   // Progress Report state
   const [progressAllLogs, setProgressAllLogs] = useState([]);
@@ -245,14 +274,52 @@ const WorkoutApp = () => {
     }
     setLoading(true);
     setError('');
+
+    const today = getLocalToday();
+    const newWeight = parseFloat(weight);
+    const newReps = parseInt(reps);
+    const exName = exercises.find(e => e.id === selectedExercise)?.name || 'Exercise';
+
+    // ── Optimistic updates (instant) ──
+    const optimisticId = 'optimistic-' + Date.now();
+    if (selectedCalendarDate === today) {
+      setSelectedDateWorkouts(prev => [...prev, {
+        id: optimisticId,
+        exercise: exName,
+        exerciseId: selectedExercise,
+        weight: newWeight,
+        reps: newReps,
+        sets: 1,
+      }]);
+    }
+    setWorkoutDates(prev => new Set([...prev, today]));
+    updateOverloadIncremental(selectedExercise, today, newWeight, newReps);
+    // Recompute double progression from updated cache
+    if (overloadCacheRef.current) computeDoubleProgression(overloadCacheRef.current);
+    setLastUsedWeights(prev => ({ ...prev, [selectedExercise]: { weight: newWeight, reps: newReps } }));
+    setWeight('');
+    setReps('');
+    startRestTimer(restDuration);
+    if (navigator.vibrate && !prCelebration) navigator.vibrate([50]);
+
+    // Active workout: track sets logged and auto-advance
+    if (activeTemplate) {
+      const currentExId = selectedExercise;
+      setActiveWorkoutSetsLogged(prev => {
+        const logged = (prev[currentExId] || 0) + 1;
+        const targetSets = activeTemplate.exercises?.[activeExerciseIndex]?.sets || 3;
+        if (logged >= targetSets && activeExerciseIndex < activeTemplate.exerciseIds.length - 1) {
+          setTimeout(() => advanceToNextExercise(), 500);
+        }
+        return { ...prev, [currentExId]: logged };
+      });
+    }
+
+    // ── Server sync (background) ──
     try {
-      const today = getLocalToday();
-      const newWeight = parseFloat(weight);
-      const newReps = parseInt(reps);
       const result = await api.createWorkoutLog(user.id, selectedExercise, today, newWeight, newReps);
 
       // PR detection
-      const exName = exercises.find(e => e.id === selectedExercise)?.name || 'Exercise';
       const new1RM = compute1RM(newWeight, newReps);
       const prev = prMap[selectedExercise];
       if (prev) {
@@ -265,7 +332,6 @@ const WorkoutApp = () => {
           setTimeout(() => setPrCelebration(null), 5000);
           if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
         }
-        // Update PR map incrementally
         setPrMap(m => ({
           ...m,
           [selectedExercise]: {
@@ -275,22 +341,17 @@ const WorkoutApp = () => {
         }));
       }
 
-      // Update smart defaults
-      setLastUsedWeights(prev => ({ ...prev, [selectedExercise]: { weight: newWeight, reps: newReps } }));
+      // Replace optimistic record with real ID
+      if (selectedCalendarDate === today) {
+        setSelectedDateWorkouts(prev =>
+          prev.map(w => w.id === optimisticId ? { ...w, id: result.id } : w)
+        );
+      }
 
-      setWeight('');
-      setReps('');
-      await loadWorkoutsForDate(selectedCalendarDate);
+      // Background: accurate dates for streak
       const dates = await api.fetchWorkoutDates(user.id);
       setWorkoutDates(dates);
-      computeProgressiveOverload();
       setStreak(computeStreak(dates));
-
-      // Start rest timer
-      startRestTimer(restDuration);
-
-      // Haptic feedback
-      if (navigator.vibrate && !prCelebration) navigator.vibrate([50]);
 
       // Toast with undo
       const recordId = result.id;
@@ -299,11 +360,15 @@ const WorkoutApp = () => {
         await loadWorkoutsForDate(selectedCalendarDate);
         const d = await api.fetchWorkoutDates(user.id);
         setWorkoutDates(d);
-        computeProgressiveOverload();
+        debouncedOverloadRecompute();
         setStreak(computeStreak(d));
         showToast('success', 'Set undone');
       });
     } catch (err) {
+      // Rollback optimistic update on error
+      if (selectedCalendarDate === today) {
+        setSelectedDateWorkouts(prev => prev.filter(w => w.id !== optimisticId));
+      }
       showToast('error', 'Error logging set: ' + err.message);
     }
     setLoading(false);
@@ -333,7 +398,7 @@ const WorkoutApp = () => {
       await api.updateWorkoutLog(recordId, parseFloat(editWeight), parseInt(editReps));
       cancelEdit();
       await loadWorkoutsForDate(selectedCalendarDate);
-      computeProgressiveOverload();
+      debouncedOverloadRecompute();
     } catch (err) {
       setError('Error updating set: ' + err.message);
     }
@@ -347,7 +412,7 @@ const WorkoutApp = () => {
       setDeleteConfirmId(null);
       await loadWorkoutsForDate(selectedCalendarDate);
       await loadWorkoutDates();
-      computeProgressiveOverload();
+      debouncedOverloadRecompute();
     } catch (err) {
       setError('Error deleting set: ' + err.message);
     }
@@ -409,12 +474,45 @@ const WorkoutApp = () => {
     }
   };
 
+  const addNewExercise = async () => {
+    if (!newExerciseName.trim()) {
+      setError('Exercise name is required');
+      return;
+    }
+    const exists = exercises.find(
+      ex => ex.name.toLowerCase() === newExerciseName.trim().toLowerCase()
+    );
+    if (exists) {
+      setError('Exercise already exists');
+      return;
+    }
+    try {
+      const newEx = await api.createExercise(user.id, newExerciseName.trim(), newExerciseMuscle || null);
+      setExercises(prev => [...prev, newEx].sort((a, b) => a.name.localeCompare(b.name)));
+      if (editingTemplate) {
+        setTemplateExercises(prev => [...prev, { exerciseId: newEx.id, sets: 3 }]);
+      }
+      setNewExerciseName('');
+      setNewExerciseMuscle('');
+      setShowAddExercise(false);
+      setError('');
+      showToast('success', `Added "${newEx.name}"`);
+    } catch (err) {
+      if (err.message?.includes('duplicate') || err.message?.includes('unique')) {
+        setError('An exercise with this name already exists');
+      } else {
+        setError('Error adding exercise: ' + err.message);
+      }
+    }
+  };
+
   const startActiveWorkout = (template) => {
     setActiveTemplate(template);
     setActiveExerciseIndex(0);
     setSelectedExercise(template.exerciseIds[0]);
     setWeight('');
     setReps('');
+    setActiveWorkoutSetsLogged({});
     setDashboardView('activeWorkout');
   };
 
@@ -432,56 +530,151 @@ const WorkoutApp = () => {
     setActiveTemplate(null);
     setActiveExerciseIndex(0);
     setSelectedExercise('');
+    setActiveWorkoutSetsLogged({});
     setDashboardView('main');
   };
 
   // ─── Progressive Overload (Phase 3) ────────────────────
 
+  const computeOverloadFromRecords = (allRecords) => {
+    const byExercise = {};
+    allRecords.forEach(r => {
+      const exId = r.exercise_id;
+      if (!exId) return;
+      if (!byExercise[exId]) byExercise[exId] = [];
+      byExercise[exId].push({
+        date: r.date,
+        weight: r.weight_kg || 0,
+        reps: r.reps || 0
+      });
+    });
+
+    const overloadSet = new Set();
+
+    Object.values(byExercise).forEach(entries => {
+      const sessions = {};
+      entries.forEach(e => {
+        if (!sessions[e.date]) sessions[e.date] = [];
+        sessions[e.date].push(e);
+      });
+      const sessionDates = Object.keys(sessions).sort();
+
+      for (let i = 1; i < sessionDates.length; i++) {
+        const prevSets = sessions[sessionDates[i - 1]];
+        const currSets = sessions[sessionDates[i]];
+        const prevMaxWeight = Math.max(...prevSets.map(s => s.weight));
+        const prevMaxRepsAtMax = Math.max(...prevSets.filter(s => s.weight === prevMaxWeight).map(s => s.reps));
+
+        const hasOverload = currSets.some(s =>
+          s.weight > prevMaxWeight ||
+          (s.weight === prevMaxWeight && s.reps > prevMaxRepsAtMax)
+        );
+        if (hasOverload) overloadSet.add(sessionDates[i]);
+      }
+    });
+    return overloadSet;
+  };
+
   const computeProgressiveOverload = async () => {
     if (!user) return;
     try {
       const allRecords = await api.fetchAllUserLogs(user.id);
-
-      const byExercise = {};
-      allRecords.forEach(r => {
-        const exId = r.exercise_id;
-        if (!exId) return;
-        if (!byExercise[exId]) byExercise[exId] = [];
-        byExercise[exId].push({
-          date: r.date,
-          weight: r.weight_kg || 0,
-          reps: r.reps || 0
-        });
-      });
-
-      const overloadSet = new Set();
-
-      Object.values(byExercise).forEach(entries => {
-        const sessions = {};
-        entries.forEach(e => {
-          if (!sessions[e.date]) sessions[e.date] = [];
-          sessions[e.date].push(e);
-        });
-        const sessionDates = Object.keys(sessions).sort();
-
-        for (let i = 1; i < sessionDates.length; i++) {
-          const prevSets = sessions[sessionDates[i - 1]];
-          const currSets = sessions[sessionDates[i]];
-          const prevMaxWeight = Math.max(...prevSets.map(s => s.weight));
-          const prevMaxRepsAtMax = Math.max(...prevSets.filter(s => s.weight === prevMaxWeight).map(s => s.reps));
-
-          const hasOverload = currSets.some(s =>
-            s.weight > prevMaxWeight ||
-            (s.weight === prevMaxWeight && s.reps > prevMaxRepsAtMax)
-          );
-          if (hasOverload) overloadSet.add(sessionDates[i]);
-        }
-      });
-
-      setOverloadDates(overloadSet);
+      overloadCacheRef.current = allRecords;
+      setOverloadDates(computeOverloadFromRecords(allRecords));
     } catch (err) {
       console.error('Failed to compute progressive overload:', err);
     }
+  };
+
+  const updateOverloadIncremental = (exerciseId, date, weightKg, reps) => {
+    if (!overloadCacheRef.current) return;
+    const newRecord = { exercise_id: exerciseId, date, weight_kg: weightKg, reps };
+    overloadCacheRef.current = [...overloadCacheRef.current, newRecord];
+    setOverloadDates(computeOverloadFromRecords(overloadCacheRef.current));
+  };
+
+  const debouncedOverloadRecompute = () => {
+    if (overloadDebounceRef.current) clearTimeout(overloadDebounceRef.current);
+    overloadDebounceRef.current = setTimeout(() => computeProgressiveOverload(), 2000);
+  };
+
+  // ─── Double Progression Model ──────────────────────────
+
+  const computeDoubleProgression = (allRecords) => {
+    if (!allRecords || allRecords.length === 0) return;
+    const byExercise = {};
+    allRecords.forEach(r => {
+      if (!r.exercise_id) return;
+      if (!byExercise[r.exercise_id]) byExercise[r.exercise_id] = [];
+      byExercise[r.exercise_id].push(r);
+    });
+
+    const recs = {};
+    Object.entries(byExercise).forEach(([exId, records]) => {
+      // Group by date
+      const byDate = {};
+      records.forEach(r => {
+        if (!byDate[r.date]) byDate[r.date] = [];
+        byDate[r.date].push(r);
+      });
+      // Get most recent session
+      const dates = Object.keys(byDate).sort();
+      if (dates.length === 0) return;
+      const latestDate = dates[dates.length - 1];
+      const latestSets = byDate[latestDate];
+      // Sort by created_at to find first set
+      latestSets.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
+      const firstSet = latestSets[0];
+      if (!firstSet || !firstSet.weight_kg || firstSet.weight_kg <= 0) return;
+      if (firstSet.reps >= DOUBLE_PROGRESSION_THRESHOLD) {
+        const newWeight = Math.ceil(firstSet.weight_kg * 1.05 * 2) / 2;
+        recs[exId] = {
+          reps: firstSet.reps,
+          weight: firstSet.weight_kg,
+          recommendedWeight: newWeight,
+        };
+      }
+    });
+    setDoubleProgressionRecs(recs);
+  };
+
+  // ─── Exercise Progression Timeline ────────────────────
+
+  const getExerciseProgressionTimeline = (exerciseId) => {
+    if (!overloadCacheRef.current) return [];
+    const records = overloadCacheRef.current.filter(r => r.exercise_id === exerciseId);
+    if (records.length === 0) return [];
+
+    const byDate = {};
+    records.forEach(r => {
+      if (!byDate[r.date]) byDate[r.date] = [];
+      byDate[r.date].push(r);
+    });
+    const dates = Object.keys(byDate).sort();
+
+    const timeline = [];
+    for (let i = 0; i < dates.length; i++) {
+      const sets = byDate[dates[i]];
+      const maxWeight = Math.max(...sets.map(s => s.weight_kg || 0));
+      const maxRepsAtMax = Math.max(...sets.filter(s => (s.weight_kg || 0) === maxWeight).map(s => s.reps || 0));
+
+      let status = 'first';
+      if (i > 0) {
+        const prevSets = byDate[dates[i - 1]];
+        const prevMaxWeight = Math.max(...prevSets.map(s => s.weight_kg || 0));
+        const prevMaxRepsAtMax = Math.max(...prevSets.filter(s => (s.weight_kg || 0) === prevMaxWeight).map(s => s.reps || 0));
+
+        if (maxWeight > prevMaxWeight || (maxWeight === prevMaxWeight && maxRepsAtMax > prevMaxRepsAtMax)) {
+          status = 'improved';
+        } else if (maxWeight === prevMaxWeight && maxRepsAtMax === prevMaxRepsAtMax) {
+          status = 'maintained';
+        } else {
+          status = 'regressed';
+        }
+      }
+      timeline.push({ date: dates[i], status, weight: maxWeight, reps: maxRepsAtMax });
+    }
+    return timeline.slice(-12);
   };
 
   // ─── Import Previous Workouts ─────────────────────────
@@ -702,6 +895,13 @@ const WorkoutApp = () => {
     return d > 0 ? weight / d : null;
   };
 
+  const computeEquivalentReps = (currentWeight, currentReps, targetWeight) => {
+    const est1RM = compute1RM(currentWeight, currentReps);
+    if (!est1RM || targetWeight >= est1RM || targetWeight <= 0) return null;
+    const eqReps = Math.round((1 - targetWeight / est1RM) / 0.0278);
+    return eqReps >= 1 && eqReps <= 30 ? eqReps : null;
+  };
+
   const getMonthlyBest = (exerciseId) => {
     const byMonth = {};
     progressAllLogs
@@ -830,18 +1030,67 @@ const WorkoutApp = () => {
     const mondayOffset = day === 0 ? -6 : 1 - day;
     const thisMonday = new Date(today);
     thisMonday.setDate(today.getDate() + mondayOffset);
-    const lastMonday = new Date(thisMonday);
-    lastMonday.setDate(thisMonday.getDate() - 7);
-    const lastSunday = new Date(thisMonday);
-    lastSunday.setDate(thisMonday.getDate() - 1);
 
     const fmt = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+    // Compute 4 week boundaries
+    const weekBounds = [];
+    for (let w = 0; w < 4; w++) {
+      const mon = new Date(thisMonday);
+      mon.setDate(thisMonday.getDate() - w * 7);
+      const sun = new Date(mon);
+      sun.setDate(mon.getDate() + 6);
+      const endDate = w === 0 ? today : sun;
+      weekBounds.push({ start: fmt(mon), end: fmt(endDate), label: `W${4 - w}` });
+    }
+
     try {
-      const [thisWeek, lastWeek] = await Promise.all([
-        api.fetchLogsForDateRange(user.id, fmt(thisMonday), fmt(today)),
-        api.fetchLogsForDateRange(user.id, fmt(lastMonday), fmt(lastSunday)),
-      ]);
-      const vol = logs => logs.reduce((s, l) => s + l.weight_kg * l.reps, 0);
+      const weekData = await Promise.all(
+        weekBounds.map(wb => api.fetchLogsForDateRange(user.id, wb.start, wb.end))
+      );
+      const thisWeek = weekData[0];
+      const lastWeek = weekData[1];
+      const vol = logs => logs.reduce((s, l) => s + (l.weight_kg || 0) * (l.reps || 0), 0);
+
+      // Volume by muscle group
+      const volumeByMuscle = {};
+      thisWeek.forEach(l => {
+        const ex = exercises.find(e => e.id === l.exercise_id);
+        const muscle = ex?.primary_muscle || 'other';
+        const displayMuscle = muscle.replace(/_/g, ' ');
+        volumeByMuscle[displayMuscle] = (volumeByMuscle[displayMuscle] || 0) + (l.weight_kg || 0) * (l.reps || 0);
+      });
+      Object.keys(volumeByMuscle).forEach(k => { volumeByMuscle[k] = Math.round(volumeByMuscle[k]); });
+
+      // Overload count this week
+      let overloadCount = 0;
+      if (overloadCacheRef.current) {
+        const thisWeekStart = weekBounds[0].start;
+        const thisWeekEnd = weekBounds[0].end;
+        const weekOverload = computeOverloadFromRecords(overloadCacheRef.current);
+        const thisWeekDates = new Set(thisWeek.map(l => l.date));
+        thisWeekDates.forEach(d => { if (weekOverload.has(d)) overloadCount++; });
+      }
+
+      // PR count this week
+      let prCount = 0;
+      const thisWeekExIds = [...new Set(thisWeek.map(l => l.exercise_id))];
+      thisWeekExIds.forEach(exId => {
+        const weekBest = thisWeek.filter(l => l.exercise_id === exId)
+          .reduce((best, l) => {
+            const orm = compute1RM(l.weight_kg, l.reps);
+            return orm && orm > best ? orm : best;
+          }, 0);
+        if (weekBest > 0 && prMap[exId] && weekBest >= prMap[exId].max1RM) prCount++;
+      });
+
+      // Weekly trend (4 weeks)
+      const weeklyTrend = weekBounds.map((wb, i) => ({
+        week: wb.label,
+        volume: Math.round(vol(weekData[i])),
+        sets: weekData[i].length,
+      })).reverse();
+
       setWeeklySummary({
         sets: thisWeek.length,
         volume: Math.round(vol(thisWeek)),
@@ -849,6 +1098,10 @@ const WorkoutApp = () => {
         days: new Set(thisWeek.map(l => l.date)).size,
         lastWeekVolume: Math.round(vol(lastWeek)),
         lastWeekSets: lastWeek.length,
+        volumeByMuscle,
+        overloadCount,
+        prCount,
+        weeklyTrend,
       });
     } catch (err) {
       console.error('Failed to compute weekly summary:', err);
@@ -961,11 +1214,17 @@ const WorkoutApp = () => {
       loadProteinLogs(initialDate);
       // Load smart defaults (last used weight/reps per exercise)
       api.fetchLastSetsForAllExercises(user.id).then(map => setLastUsedWeights(map)).catch(() => {});
-      // Load all logs for PR map
+      // Load all logs for PR map + double progression
       api.fetchAllUserLogs(user.id).then(logs => {
         setProgressAllLogs(logs);
         setPrMap(buildPrMap(logs));
+        computeDoubleProgression(logs);
       }).catch(() => {});
+      // Load weight stacks from localStorage
+      try {
+        const saved = localStorage.getItem('gymtracker_weightStacks');
+        if (saved) setWeightStacks(JSON.parse(saved));
+      } catch (e) {}
       // Weekly summary
       computeWeeklySummary();
       // Load profile data for Slack status
@@ -985,6 +1244,13 @@ const WorkoutApp = () => {
   useEffect(() => {
     localStorage.setItem('gymtracker_dashboardView', dashboardView);
   }, [dashboardView]);
+
+  // Persist weight stacks to localStorage
+  useEffect(() => {
+    if (Object.keys(weightStacks).length > 0) {
+      localStorage.setItem('gymtracker_weightStacks', JSON.stringify(weightStacks));
+    }
+  }, [weightStacks]);
 
   // Cleanup rest timer on unmount
   useEffect(() => {
@@ -1222,25 +1488,116 @@ const WorkoutApp = () => {
           {/* ── Weekly Summary + Repeat Last Workout ────── */}
           {dashboardView === 'main' && (
             <div className="max-w-7xl mx-auto mb-6 space-y-3">
-              {/* Weekly summary bar */}
+              {/* Weekly Summary Dashboard */}
               {weeklySummary && weeklySummary.sets > 0 && (
-                <div className="flex flex-wrap items-center gap-4 bg-gray-800/60 border border-gray-700/50 rounded-xl px-5 py-3 text-sm">
-                  <span className="font-semibold text-gray-300">This week</span>
-                  <span className="text-yellow-400 font-bold">{weeklySummary.sets} sets</span>
-                  <span className="text-gray-500">·</span>
-                  <span className="text-gray-300">{weeklySummary.volume.toLocaleString()}kg volume</span>
-                  <span className="text-gray-500">·</span>
-                  <span className="text-gray-300">{weeklySummary.exercises} exercises</span>
-                  <span className="text-gray-500">·</span>
-                  <span className="text-gray-300">{weeklySummary.days} days</span>
-                  {weeklySummary.lastWeekSets > 0 && (() => {
-                    const pct = Math.round(((weeklySummary.volume - weeklySummary.lastWeekVolume) / weeklySummary.lastWeekVolume) * 100);
-                    return (
-                      <span className={`font-bold ${pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {pct >= 0 ? '▲' : '▼'} {Math.abs(pct)}% vs last week
-                      </span>
-                    );
-                  })()}
+                <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl px-5 py-4">
+                  {/* Header row */}
+                  <div className="flex flex-wrap items-center gap-4 text-sm mb-4">
+                    <span className="font-semibold text-gray-300">This Week</span>
+                    <span className="text-yellow-400 font-bold">{weeklySummary.sets} sets</span>
+                    <span className="text-gray-500">·</span>
+                    <span className="text-gray-300">{weeklySummary.volume.toLocaleString()}kg volume</span>
+                    <span className="text-gray-500">·</span>
+                    <span className="text-gray-300">{weeklySummary.exercises} exercises</span>
+                    <span className="text-gray-500">·</span>
+                    <span className="text-gray-300">{weeklySummary.days}/7 days</span>
+                    {weeklySummary.lastWeekSets > 0 && (() => {
+                      const pct = Math.round(((weeklySummary.volume - weeklySummary.lastWeekVolume) / weeklySummary.lastWeekVolume) * 100);
+                      return (
+                        <span className={`font-bold ${pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {pct >= 0 ? '▲' : '▼'} {Math.abs(pct)}% vs last week
+                        </span>
+                      );
+                    })()}
+                  </div>
+
+                  {/* 3-column detail grid */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    {/* Volume by muscle group */}
+                    {weeklySummary.volumeByMuscle && Object.keys(weeklySummary.volumeByMuscle).length > 0 && (
+                      <div className="bg-gray-900/50 rounded-lg p-3">
+                        <h4 className="text-xs font-semibold text-gray-500 mb-2 uppercase tracking-wide">Volume by Muscle</h4>
+                        <div className="space-y-1.5">
+                          {Object.entries(weeklySummary.volumeByMuscle)
+                            .sort(([,a], [,b]) => b - a)
+                            .slice(0, 6)
+                            .map(([muscle, vol]) => {
+                              const maxVol = Math.max(...Object.values(weeklySummary.volumeByMuscle));
+                              return (
+                                <div key={muscle} className="flex items-center gap-2 text-xs">
+                                  <span className="text-gray-400 capitalize w-16 truncate">{muscle}</span>
+                                  <div className="flex-1 bg-gray-800 rounded-full h-2 overflow-hidden">
+                                    <div className="bg-yellow-500 h-full rounded-full" style={{ width: `${(vol / maxVol) * 100}%` }} />
+                                  </div>
+                                  <span className="text-gray-500 w-14 text-right">{vol.toLocaleString()}kg</span>
+                                </div>
+                              );
+                            })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Consistency & Trend */}
+                    <div className="bg-gray-900/50 rounded-lg p-3">
+                      <h4 className="text-xs font-semibold text-gray-500 mb-2 uppercase tracking-wide">Consistency</h4>
+                      <div className="flex items-center gap-3 mb-3">
+                        <div className="text-center">
+                          <div className="text-2xl font-bold text-white">{weeklySummary.days}</div>
+                          <div className="text-xs text-gray-500">days</div>
+                        </div>
+                        {streak > 0 && (
+                          <div className="text-center">
+                            <div className="text-2xl font-bold text-orange-400">{streak}d</div>
+                            <div className="text-xs text-gray-500">streak</div>
+                          </div>
+                        )}
+                      </div>
+                      {weeklySummary.weeklyTrend && (
+                        <div>
+                          <div className="text-xs text-gray-500 mb-1">4-Week Volume</div>
+                          <div className="flex items-end gap-1 h-10">
+                            {weeklySummary.weeklyTrend.map((w, i) => {
+                              const maxVol = Math.max(...weeklySummary.weeklyTrend.map(t => t.volume));
+                              const pct = maxVol > 0 ? (w.volume / maxVol) * 100 : 0;
+                              const isCurrent = i === weeklySummary.weeklyTrend.length - 1;
+                              return (
+                                <div key={w.week} className="flex-1 flex flex-col items-center gap-0.5">
+                                  <div className={`w-full rounded-sm ${isCurrent ? 'bg-yellow-500' : 'bg-gray-600'}`}
+                                    style={{ height: `${Math.max(pct, 5)}%` }} />
+                                  <span className="text-[10px] text-gray-600">{w.week}</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Progression */}
+                    <div className="bg-gray-900/50 rounded-lg p-3">
+                      <h4 className="text-xs font-semibold text-gray-500 mb-2 uppercase tracking-wide">Progression</h4>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-green-500/15 text-green-400 font-bold text-lg">
+                            {weeklySummary.overloadCount || 0}
+                          </span>
+                          <div>
+                            <div className="text-sm text-white font-medium">Overload Days</div>
+                            <div className="text-xs text-gray-500">Sessions with progression</div>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-yellow-500/15 text-yellow-400 font-bold text-lg">
+                            {weeklySummary.prCount || 0}
+                          </span>
+                          <div>
+                            <div className="text-sm text-white font-medium">PRs Hit</div>
+                            <div className="text-xs text-gray-500">Exercises at all-time best</div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               )}
               {/* Repeat last workout button */}
@@ -1278,7 +1635,7 @@ const WorkoutApp = () => {
                   </div>
                   {!editingTemplate && (
                     <button
-                      onClick={() => { setEditingTemplate({ id: null }); setTemplateName(''); setTemplateExercises([]); setError(''); }}
+                      onClick={() => { setEditingTemplate({ id: null }); setTemplateName(''); setTemplateExercises([]); setTemplateExerciseSearch(''); setShowAddExercise(false); setError(''); }}
                       className="flex items-center gap-1 bg-yellow-500 hover:bg-yellow-400 text-gray-900 font-bold px-4 py-2 rounded-lg transition">
                       <Plus className="w-4 h-4" /> New Template
                     </button>
@@ -1291,29 +1648,124 @@ const WorkoutApp = () => {
                     <input type="text" value={templateName} onChange={(e) => setTemplateName(e.target.value)}
                       placeholder="Template name (e.g. Push Day)" className={inputClass + ' mb-4'} />
                     <label className="block text-sm font-semibold text-gray-400 mb-2">Add exercises:</label>
-                    <select
-                      onChange={(e) => {
-                        if (e.target.value && !templateExercises.includes(e.target.value)) {
-                          setTemplateExercises([...templateExercises, e.target.value]);
-                        }
-                        e.target.value = '';
-                      }}
-                      className="w-full px-4 py-2.5 rounded-lg bg-gray-800 border border-gray-600 text-white mb-3 focus:outline-none focus:border-yellow-500"
-                      defaultValue="">
-                      <option value="" disabled>Select exercise to add...</option>
-                      {exercises.filter(ex => !templateExercises.includes(ex.id)).map(ex => (
-                        <option key={ex.id} value={ex.id}>{ex.name}</option>
-                      ))}
-                    </select>
+                    {/* Searchable exercise input (like Log Set) */}
+                    <div className="relative mb-1">
+                      <input
+                        type="text"
+                        value={templateExerciseSearch}
+                        onChange={(e) => { setTemplateExerciseSearch(e.target.value); setShowTemplateExerciseDropdown(true); }}
+                        onFocus={() => setShowTemplateExerciseDropdown(true)}
+                        placeholder="Type to search exercises..."
+                        className="w-full px-4 py-2.5 rounded-lg bg-gray-800 border border-gray-600 text-white placeholder-gray-500 focus:outline-none focus:border-yellow-500 transition"
+                      />
+                      {showTemplateExerciseDropdown && (
+                        <div className="absolute z-50 w-full mt-1 max-h-52 overflow-y-auto bg-gray-900 border border-gray-700 rounded-lg shadow-xl">
+                          {!templateExerciseSearch.trim() && Object.keys(lastUsedWeights).length > 0 && (
+                            <>
+                              <div className="px-3 py-1.5 text-xs text-gray-500 font-semibold">Recent</div>
+                              {Object.keys(lastUsedWeights).slice(0, 5)
+                                .filter(exId => !templateExercises.some(t => t.exerciseId === exId))
+                                .map(exId => {
+                                  const ex = exercises.find(e => e.id === exId);
+                                  if (!ex) return null;
+                                  return (
+                                    <button key={exId} type="button"
+                                      onClick={() => {
+                                        setTemplateExercises(prev => [...prev, { exerciseId: ex.id, sets: 3 }]);
+                                        setTemplateExerciseSearch('');
+                                        setShowTemplateExerciseDropdown(false);
+                                      }}
+                                      className="w-full text-left px-4 py-2 hover:bg-gray-800 text-sm text-white transition flex justify-between">
+                                      <span>{ex.name}</span>
+                                      <span className="text-gray-500 text-xs capitalize">{ex.primary_muscle?.replace(/_/g, ' ')}</span>
+                                    </button>
+                                  );
+                                })}
+                              <div className="border-t border-gray-700" />
+                            </>
+                          )}
+                          {templateExerciseSearch.trim() && exercises
+                            .filter(ex =>
+                              ex.name.toLowerCase().includes(templateExerciseSearch.toLowerCase()) &&
+                              !templateExercises.some(t => t.exerciseId === ex.id)
+                            )
+                            .slice(0, 8)
+                            .map(ex => (
+                              <button key={ex.id} type="button"
+                                onClick={() => {
+                                  setTemplateExercises(prev => [...prev, { exerciseId: ex.id, sets: 3 }]);
+                                  setTemplateExerciseSearch('');
+                                  setShowTemplateExerciseDropdown(false);
+                                }}
+                                className="w-full text-left px-4 py-2 hover:bg-gray-800 text-sm text-white transition">
+                                <span>{ex.name}</span>
+                                <span className="text-gray-500 text-xs ml-2 capitalize">{ex.primary_muscle?.replace(/_/g, ' ')}</span>
+                              </button>
+                            ))}
+                          {templateExerciseSearch.trim() &&
+                            exercises.filter(ex =>
+                              ex.name.toLowerCase().includes(templateExerciseSearch.toLowerCase()) &&
+                              !templateExercises.some(t => t.exerciseId === ex.id)
+                            ).length === 0 && (
+                            <div className="px-4 py-3 text-gray-500 text-sm">No exercises found</div>
+                          )}
+                          {!templateExerciseSearch.trim() && Object.keys(lastUsedWeights).length === 0 && (
+                            <div className="px-4 py-3 text-gray-500 text-sm">Start typing to search exercises</div>
+                          )}
+                        </div>
+                      )}
+                      {showTemplateExerciseDropdown && (
+                        <div className="fixed inset-0 z-40" onClick={() => setShowTemplateExerciseDropdown(false)} />
+                      )}
+                    </div>
+                    {/* Add new exercise toggle */}
+                    <button
+                      type="button"
+                      onClick={() => setShowAddExercise(!showAddExercise)}
+                      className="text-xs text-yellow-400 hover:text-yellow-300 transition mb-3">
+                      {showAddExercise ? '- Cancel adding exercise' : '+ Add New Exercise'}
+                    </button>
+                    {showAddExercise && (
+                      <div className="mb-3 p-3 bg-gray-800 rounded-lg border border-gray-600 space-y-2">
+                        <input type="text" value={newExerciseName}
+                          onChange={e => setNewExerciseName(e.target.value)}
+                          placeholder="Exercise name (e.g. Cable Flye)"
+                          className="w-full px-3 py-2 rounded-lg bg-gray-900 border border-gray-600 text-white text-sm placeholder-gray-500 focus:outline-none focus:border-yellow-500" />
+                        <select value={newExerciseMuscle}
+                          onChange={e => setNewExerciseMuscle(e.target.value)}
+                          className="w-full px-3 py-2 rounded-lg bg-gray-900 border border-gray-600 text-white text-sm focus:outline-none focus:border-yellow-500">
+                          <option value="">Select muscle group (optional)</option>
+                          {[...new Set(exercises.map(ex => ex.primary_muscle).filter(Boolean))].sort().map(m => (
+                            <option key={m} value={m}>{m.replace(/_/g, ' ')}</option>
+                          ))}
+                        </select>
+                        <button onClick={addNewExercise}
+                          className="bg-yellow-500 hover:bg-yellow-400 text-gray-900 font-bold px-3 py-1.5 rounded-lg text-sm transition">
+                          Add Exercise
+                        </button>
+                      </div>
+                    )}
+                    {/* Exercise list with sets */}
                     {templateExercises.length > 0 && (
                       <div className="space-y-2 mb-4">
-                        {templateExercises.map((exId, idx) => {
-                          const ex = exercises.find(e => e.id === exId);
+                        {templateExercises.map((item, idx) => {
+                          const ex = exercises.find(e => e.id === item.exerciseId);
                           return (
-                            <div key={exId} className="flex items-center justify-between bg-gray-800 px-3 py-2 rounded-lg">
-                              <span className="text-sm"><span className="text-gray-500 mr-2">{idx + 1}.</span>{ex?.name || 'Unknown'}</span>
-                              <button onClick={() => setTemplateExercises(templateExercises.filter(id => id !== exId))}
-                                className="text-red-400 hover:text-red-300 p-1"><X className="w-4 h-4" /></button>
+                            <div key={item.exerciseId} className="flex items-center justify-between bg-gray-800 px-3 py-2 rounded-lg">
+                              <span className="text-sm flex-1"><span className="text-gray-500 mr-2">{idx + 1}.</span>{ex?.name || 'Unknown'}</span>
+                              <div className="flex items-center gap-2">
+                                <input type="number" min="1" max="10" value={item.sets}
+                                  onChange={e => {
+                                    const newSets = parseInt(e.target.value) || 1;
+                                    setTemplateExercises(prev => prev.map((t, i) =>
+                                      i === idx ? { ...t, sets: newSets } : t
+                                    ));
+                                  }}
+                                  className="w-14 px-2 py-1 rounded bg-gray-700 border border-gray-600 text-white text-sm text-center focus:outline-none focus:border-yellow-500" />
+                                <span className="text-xs text-gray-500">sets</span>
+                                <button onClick={() => setTemplateExercises(templateExercises.filter((_, i) => i !== idx))}
+                                  className="text-red-400 hover:text-red-300 p-1"><X className="w-4 h-4" /></button>
+                              </div>
                             </div>
                           );
                         })}
@@ -1325,7 +1777,7 @@ const WorkoutApp = () => {
                         className="bg-yellow-500 hover:bg-yellow-400 text-gray-900 font-bold px-4 py-2 rounded-lg transition">
                         {editingTemplate.id ? 'Update' : 'Create'}
                       </button>
-                      <button onClick={() => { setEditingTemplate(null); setError(''); }}
+                      <button onClick={() => { setEditingTemplate(null); setShowAddExercise(false); setError(''); }}
                         className="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded-lg transition">Cancel</button>
                     </div>
                   </div>
@@ -1348,7 +1800,9 @@ const WorkoutApp = () => {
                             <button onClick={() => {
                               setEditingTemplate(template);
                               setTemplateName(template.name);
-                              setTemplateExercises([...template.exerciseIds]);
+                              setTemplateExercises(template.exercises ? [...template.exercises] : template.exerciseIds.map(id => ({ exerciseId: id, sets: 3 })));
+                              setTemplateExerciseSearch('');
+                              setShowAddExercise(false);
                               setError('');
                             }} className="p-1.5 text-gray-400 hover:text-yellow-400 transition"><Pencil className="w-4 h-4" /></button>
                             <button onClick={() => deleteTemplate(template.id)}
@@ -1356,8 +1810,57 @@ const WorkoutApp = () => {
                           </div>
                         </div>
                         <p className="text-xs text-gray-500">
-                          {template.exerciseIds.map(id => exercises.find(e => e.id === id)?.name || 'Unknown').join(' \u2022 ')}
+                          {(template.exercises || template.exerciseIds.map(id => ({ exerciseId: id, sets: 3 }))).map(item => {
+                            const ex = exercises.find(e => e.id === item.exerciseId);
+                            return `${ex?.name || 'Unknown'} (${item.sets}x)`;
+                          }).join(' \u2022 ')}
                         </p>
+                        {/* Progression toggle */}
+                        <button
+                          type="button"
+                          onClick={() => setExpandedTemplateId(expandedTemplateId === template.id ? null : template.id)}
+                          className="mt-2 text-xs text-yellow-400 hover:text-yellow-300 transition flex items-center gap-1">
+                          <TrendingUp className="w-3 h-3" />
+                          {expandedTemplateId === template.id ? 'Hide Progression' : 'Show Progression'}
+                        </button>
+                        {/* Progression Timeline */}
+                        {expandedTemplateId === template.id && (
+                          <div className="mt-3 space-y-2 border-t border-gray-700 pt-3">
+                            {template.exerciseIds.map(exId => {
+                              const ex = exercises.find(e => e.id === exId);
+                              const timeline = getExerciseProgressionTimeline(exId);
+                              if (timeline.length === 0) return (
+                                <div key={exId} className="flex items-center gap-2 text-xs">
+                                  <span className="text-gray-500 w-24 truncate">{ex?.name || 'Unknown'}</span>
+                                  <span className="text-gray-600">No data</span>
+                                </div>
+                              );
+                              const latest = timeline[timeline.length - 1];
+                              return (
+                                <div key={exId} className="flex items-center gap-2">
+                                  <span className="text-xs text-gray-400 w-24 truncate flex-shrink-0" title={ex?.name}>{ex?.name || 'Unknown'}</span>
+                                  <div className="flex gap-0.5 flex-shrink-0">
+                                    {timeline.map((s, i) => (
+                                      <div key={i} title={`${s.date}: ${s.weight}kg x ${s.reps} (${s.status})`}
+                                        className={`w-3 h-3 rounded-full ${
+                                          s.status === 'improved' ? 'bg-green-500' :
+                                          s.status === 'regressed' ? 'bg-red-500' :
+                                          s.status === 'first' ? 'bg-blue-500' :
+                                          'bg-gray-600'
+                                        }`} />
+                                    ))}
+                                  </div>
+                                  <span className="text-xs text-gray-500 ml-auto flex-shrink-0">{latest.weight}kg x {latest.reps}</span>
+                                </div>
+                              );
+                            })}
+                            <div className="flex gap-3 text-[10px] text-gray-600 mt-1">
+                              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-green-500 inline-block" /> Improved</span>
+                              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-gray-600 inline-block" /> Same</span>
+                              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500 inline-block" /> Regressed</span>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -1379,29 +1882,56 @@ const WorkoutApp = () => {
 
                 {/* Exercise progress pills */}
                 <div className="flex gap-2 mb-6 flex-wrap">
-                  {activeTemplate.exerciseIds.map((exId, idx) => (
-                    <button key={exId}
-                      onClick={() => { setActiveExerciseIndex(idx); setSelectedExercise(exId); setWeight(''); setReps(''); }}
-                      className={`text-xs px-3 py-1.5 rounded-full transition font-medium ${
-                        idx === activeExerciseIndex
-                          ? 'bg-yellow-500 text-gray-900'
-                          : idx < activeExerciseIndex
-                            ? 'bg-green-600 text-white'
-                            : 'bg-gray-700 text-gray-400'
-                      }`}>
-                      {exercises.find(e => e.id === exId)?.name || 'Unknown'}
-                    </button>
-                  ))}
+                  {activeTemplate.exerciseIds.map((exId, idx) => {
+                    const templateEx = activeTemplate.exercises?.[idx];
+                    const logged = activeWorkoutSetsLogged[exId] || 0;
+                    const target = templateEx?.sets || 3;
+                    return (
+                      <button key={exId}
+                        onClick={() => { setActiveExerciseIndex(idx); setSelectedExercise(exId); setWeight(''); setReps(''); }}
+                        className={`text-xs px-3 py-1.5 rounded-full transition font-medium ${
+                          idx === activeExerciseIndex
+                            ? 'bg-yellow-500 text-gray-900'
+                            : logged >= target
+                              ? 'bg-green-600 text-white'
+                              : 'bg-gray-700 text-gray-400'
+                        }`}>
+                        {exercises.find(e => e.id === exId)?.name || 'Unknown'}
+                        <span className="ml-1 opacity-70">({logged}/{target})</span>
+                      </button>
+                    );
+                  })}
                 </div>
 
                 {/* Log form */}
                 <form onSubmit={logWorkout} className="space-y-4">
                   <div>
                     <label className="block text-sm font-semibold text-gray-400 mb-2">Current Exercise</label>
-                    <div className="px-4 py-2.5 rounded-lg bg-gray-900 border border-gray-700 text-white font-semibold">
-                      {exercises.find(e => e.id === activeTemplate.exerciseIds[activeExerciseIndex])?.name || 'Unknown'}
+                    <div className="px-4 py-2.5 rounded-lg bg-gray-900 border border-gray-700 text-white font-semibold flex justify-between">
+                      <span>{exercises.find(e => e.id === activeTemplate.exerciseIds[activeExerciseIndex])?.name || 'Unknown'}</span>
+                      <span className="text-gray-400 font-normal">
+                        Set {(activeWorkoutSetsLogged[activeTemplate.exerciseIds[activeExerciseIndex]] || 0) + 1} of {activeTemplate.exercises?.[activeExerciseIndex]?.sets || 3}
+                      </span>
                     </div>
                   </div>
+                  {/* Double Progression Recommendation */}
+                  {(() => {
+                    const curExId = activeTemplate.exerciseIds[activeExerciseIndex];
+                    const rec = doubleProgressionRecs[curExId];
+                    if (!rec) return null;
+                    return (
+                      <button type="button" onClick={() => setWeight(String(rec.recommendedWeight))}
+                        className="w-full bg-yellow-500/10 border border-yellow-500/30 rounded-lg px-4 py-3 text-left hover:bg-yellow-500/20 transition">
+                        <div className="flex items-center gap-2 text-yellow-400 font-semibold text-sm">
+                          <TrendingUp className="w-4 h-4" />
+                          <span>Weight Increase Recommended</span>
+                        </div>
+                        <p className="text-gray-300 text-xs mt-1">
+                          You hit {rec.reps} reps on first set at {rec.weight}kg — try {rec.recommendedWeight}kg
+                        </p>
+                      </button>
+                    );
+                  })()}
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="block text-sm font-semibold text-gray-400 mb-2">Weight (kg)</label>
@@ -1414,6 +1944,37 @@ const WorkoutApp = () => {
                         placeholder="10" className="w-full px-3 py-2.5 rounded-lg bg-gray-900 border border-gray-700 text-white placeholder-gray-600 focus:outline-none focus:border-yellow-500 transition" />
                     </div>
                   </div>
+                  {/* AMRAP Weight Equivalence Calculator */}
+                  {(() => {
+                    const curExId = activeTemplate.exerciseIds[activeExerciseIndex];
+                    if (!weightStacks[curExId] || !weight || !reps) return null;
+                    return (
+                      <div className="bg-gray-900 border border-gray-700 rounded-lg overflow-hidden">
+                        <button type="button" onClick={() => setWeightCalcExpanded(!weightCalcExpanded)}
+                          className="w-full flex items-center justify-between px-4 py-2.5 text-sm text-gray-400 hover:text-white transition">
+                          <span className="flex items-center gap-2"><Zap className="w-3.5 h-3.5" /> AMRAP Equivalence</span>
+                          <ChevronRight className={`w-4 h-4 transition-transform ${weightCalcExpanded ? 'rotate-90' : ''}`} />
+                        </button>
+                        {weightCalcExpanded && (
+                          <div className="px-4 pb-3 space-y-1">
+                            {weightStacks[curExId]
+                              .filter(w => w !== parseFloat(weight))
+                              .map(targetW => {
+                                const eqReps = computeEquivalentReps(parseFloat(weight), parseInt(reps), targetW);
+                                const isNext = targetW > parseFloat(weight) && !weightStacks[curExId].some(w2 => w2 > parseFloat(weight) && w2 < targetW);
+                                return (
+                                  <div key={targetW} className={`flex justify-between text-sm py-1 px-2 rounded ${isNext ? 'bg-green-500/10 border border-green-500/20' : ''}`}>
+                                    <span className={isNext ? 'text-green-400 font-medium' : 'text-gray-400'}>{targetW}kg</span>
+                                    <span className={isNext ? 'text-green-300 font-medium' : 'text-white'}>{eqReps ? `~${eqReps} reps` : 'Too heavy'}</span>
+                                  </div>
+                                );
+                              })}
+                            <p className="text-xs text-gray-600 mt-2">Reps needed to match your current effort</p>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                   {error && <div className="p-3 bg-red-500 bg-opacity-15 border border-red-600 rounded-lg text-red-300 text-sm">{error}</div>}
                   {success && <div className="p-3 bg-green-500 bg-opacity-15 border border-green-600 rounded-lg text-green-300 text-sm">{success}</div>}
                   <div className="flex gap-3">
@@ -1661,6 +2222,83 @@ const WorkoutApp = () => {
                   </div>
                 </div>
               </div>
+
+              {/* Weight Stacks (AMRAP Equivalence) */}
+              <div className={cardClass}>
+                <div className="flex items-center gap-2 mb-6">
+                  <Zap className="w-6 h-6 text-green-400" />
+                  <h2 className="text-xl font-bold">Weight Stacks</h2>
+                </div>
+                <p className="text-gray-400 text-sm mb-4">
+                  Define available weights for machine exercises. The AMRAP equivalence calculator will show how many reps at a different weight match your current effort.
+                </p>
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-400 mb-2">Exercise</label>
+                    <select
+                      value={weightStackExerciseSearch}
+                      onChange={e => setWeightStackExerciseSearch(e.target.value)}
+                      className="w-full px-4 py-3 rounded-lg bg-gray-900 border border-gray-700 text-white focus:outline-none focus:border-green-500 transition"
+                    >
+                      <option value="">Select an exercise...</option>
+                      {exercises.map(ex => (
+                        <option key={ex.id} value={ex.id}>{ex.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  {weightStackExerciseSearch && (
+                    <div>
+                      <label className="block text-sm font-semibold text-gray-400 mb-2">Available Weights (comma-separated, in kg)</label>
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          value={weightStackInput}
+                          onChange={e => setWeightStackInput(e.target.value)}
+                          placeholder="20, 25, 32, 39, 45"
+                          className="flex-1 px-4 py-3 rounded-lg bg-gray-900 border border-gray-700 text-white placeholder-gray-600 focus:outline-none focus:border-green-500 transition"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const weights = weightStackInput.split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n) && n > 0).sort((a, b) => a - b);
+                            if (weights.length >= 2) {
+                              setWeightStacks(prev => ({ ...prev, [weightStackExerciseSearch]: weights }));
+                              setWeightStackInput('');
+                              setWeightStackExerciseSearch('');
+                            }
+                          }}
+                          className="bg-green-600 hover:bg-green-500 text-white font-bold px-5 py-3 rounded-lg transition"
+                        >
+                          Save
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {Object.keys(weightStacks).length > 0 && (
+                    <div className="space-y-2 mt-4">
+                      <h4 className="text-sm font-semibold text-gray-400">Configured Exercises</h4>
+                      {Object.entries(weightStacks).map(([exId, weights]) => {
+                        const ex = exercises.find(e => e.id === exId);
+                        return (
+                          <div key={exId} className="flex items-center justify-between bg-gray-900 rounded-lg px-4 py-2.5">
+                            <div>
+                              <span className="text-white text-sm font-medium">{ex?.name || exId}</span>
+                              <span className="text-gray-500 text-xs ml-2">{weights.join(', ')}kg</span>
+                            </div>
+                            <button type="button" onClick={() => setWeightStacks(prev => {
+                              const next = { ...prev };
+                              delete next[exId];
+                              return next;
+                            })} className="text-red-400 hover:text-red-300 p-1">
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
           )}
 
@@ -1869,6 +2507,22 @@ const WorkoutApp = () => {
                   <Plus className="w-6 h-6 text-yellow-400" />
                   <h2 className="text-xl font-bold">Log Set</h2>
                 </div>
+                {/* Quick-start from saved workout */}
+                {workoutTemplates.length > 0 && (
+                  <div className="mb-4">
+                    <label className="block text-xs font-semibold text-gray-500 mb-1.5">Quick Start Workout</label>
+                    <div className="flex flex-wrap gap-2">
+                      {workoutTemplates.map(template => (
+                        <button key={template.id} type="button"
+                          onClick={() => startActiveWorkout(template)}
+                          className="text-xs px-3 py-1.5 bg-gray-700 hover:bg-gray-600 border border-gray-600 rounded-lg text-gray-300 hover:text-white transition">
+                          {template.name}
+                          <span className="text-gray-500 ml-1">({template.exercises ? template.exercises.length : template.exerciseIds.length})</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <form onSubmit={logWorkout} className="space-y-4">
                   {/* Searchable exercise input */}
                   <div className="relative">
@@ -1943,6 +2597,19 @@ const WorkoutApp = () => {
                       {lastUsedWeights[selectedExercise] && <span>Last: {lastUsedWeights[selectedExercise].weight}kg x {lastUsedWeights[selectedExercise].reps}</span>}
                     </div>
                   )}
+                  {/* Double Progression Recommendation */}
+                  {selectedExercise && doubleProgressionRecs[selectedExercise] && (
+                    <button type="button" onClick={() => setWeight(String(doubleProgressionRecs[selectedExercise].recommendedWeight))}
+                      className="w-full bg-yellow-500/10 border border-yellow-500/30 rounded-lg px-4 py-3 text-left hover:bg-yellow-500/20 transition">
+                      <div className="flex items-center gap-2 text-yellow-400 font-semibold text-sm">
+                        <TrendingUp className="w-4 h-4" />
+                        <span>Weight Increase Recommended</span>
+                      </div>
+                      <p className="text-gray-300 text-xs mt-1">
+                        You hit {doubleProgressionRecs[selectedExercise].reps} reps on first set at {doubleProgressionRecs[selectedExercise].weight}kg — try {doubleProgressionRecs[selectedExercise].recommendedWeight}kg
+                      </p>
+                    </button>
+                  )}
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="block text-sm font-semibold text-gray-400 mb-2">Weight (kg)</label>
@@ -1955,6 +2622,33 @@ const WorkoutApp = () => {
                         placeholder="10" className="w-full px-3 py-2.5 rounded-lg bg-gray-900 border border-gray-700 text-white placeholder-gray-600 focus:outline-none focus:border-yellow-500 transition" />
                     </div>
                   </div>
+                  {/* AMRAP Weight Equivalence Calculator */}
+                  {selectedExercise && weightStacks[selectedExercise] && weight && reps && (
+                    <div className="bg-gray-900 border border-gray-700 rounded-lg overflow-hidden">
+                      <button type="button" onClick={() => setWeightCalcExpanded(!weightCalcExpanded)}
+                        className="w-full flex items-center justify-between px-4 py-2.5 text-sm text-gray-400 hover:text-white transition">
+                        <span className="flex items-center gap-2"><Zap className="w-3.5 h-3.5" /> AMRAP Equivalence</span>
+                        <ChevronRight className={`w-4 h-4 transition-transform ${weightCalcExpanded ? 'rotate-90' : ''}`} />
+                      </button>
+                      {weightCalcExpanded && (
+                        <div className="px-4 pb-3 space-y-1">
+                          {weightStacks[selectedExercise]
+                            .filter(w => w !== parseFloat(weight))
+                            .map(targetW => {
+                              const eqReps = computeEquivalentReps(parseFloat(weight), parseInt(reps), targetW);
+                              const isNext = targetW > parseFloat(weight) && !weightStacks[selectedExercise].some(w2 => w2 > parseFloat(weight) && w2 < targetW);
+                              return (
+                                <div key={targetW} className={`flex justify-between text-sm py-1 px-2 rounded ${isNext ? 'bg-green-500/10 border border-green-500/20' : ''}`}>
+                                  <span className={isNext ? 'text-green-400 font-medium' : 'text-gray-400'}>{targetW}kg</span>
+                                  <span className={isNext ? 'text-green-300 font-medium' : 'text-white'}>{eqReps ? `~${eqReps} reps` : 'Too heavy'}</span>
+                                </div>
+                              );
+                            })}
+                          <p className="text-xs text-gray-600 mt-2">Reps needed to match your current effort</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
                   <button type="submit" disabled={loading || !selectedExercise} className={btnPrimary}>
                     {loading ? 'Logging...' : 'Log Set'}
                   </button>
@@ -1962,7 +2656,7 @@ const WorkoutApp = () => {
               </div>
 
               {/* Panel 2: Calendar Grid */}
-              <div className={`md:col-span-1 lg:col-span-2 ${cardClass}`}>
+              <div className={`md:col-span-1 lg:col-span-1 ${cardClass}`}>
                 <div className="flex items-center justify-between mb-6">
                   <button onClick={prevMonth} className="p-2 rounded-lg bg-gray-700 hover:bg-gray-600 transition">
                     <ChevronLeft className="w-5 h-5" />
@@ -2027,8 +2721,8 @@ const WorkoutApp = () => {
                 </div>
               </div>
 
-              {/* Panel 3: Day Detail (grouped by exercise with edit/delete) */}
-              <div className={`md:col-span-2 lg:col-span-1 ${cardClass} overflow-y-auto max-h-[600px]`}>
+              {/* Panel 3: Today's Workout (grouped by exercise with edit/delete) */}
+              <div className={`md:col-span-2 lg:col-span-2 ${cardClass} overflow-y-auto max-h-[600px]`}>
                 {!selectedCalendarDate ? (
                   <div className="text-center py-12">
                     <Calendar className="w-12 h-12 text-gray-600 mx-auto mb-3" />
@@ -2064,13 +2758,20 @@ const WorkoutApp = () => {
                                 <button
                                   onClick={async () => {
                                     const lastSet = sets[sets.length - 1];
-                                    await api.createWorkoutLog(user.id, lastSet.exerciseId, getLocalToday(), lastSet.weight, lastSet.reps);
-                                    await loadWorkoutsForDate(selectedCalendarDate);
+                                    // Optimistic update
+                                    const optId = 'optimistic-' + Date.now();
+                                    setSelectedDateWorkouts(prev => [...prev, {
+                                      id: optId, exercise: exerciseName, exerciseId: lastSet.exerciseId,
+                                      weight: lastSet.weight, reps: lastSet.reps, sets: 1,
+                                    }]);
+                                    setWorkoutDates(prev => new Set([...prev, getLocalToday()]));
+                                    updateOverloadIncremental(lastSet.exerciseId, getLocalToday(), lastSet.weight, lastSet.reps);
+                                    startRestTimer(restDuration);
+                                    const result = await api.createWorkoutLog(user.id, lastSet.exerciseId, getLocalToday(), lastSet.weight, lastSet.reps);
+                                    setSelectedDateWorkouts(prev => prev.map(w => w.id === optId ? { ...w, id: result.id } : w));
                                     const d = await api.fetchWorkoutDates(user.id);
                                     setWorkoutDates(d);
-                                    computeProgressiveOverload();
                                     setStreak(computeStreak(d));
-                                    startRestTimer(restDuration);
                                     showToast('success', `${exerciseName}: ${lastSet.weight}kg x ${lastSet.reps}`);
                                   }}
                                   className="p-1 text-gray-500 hover:text-green-400 transition" title="Log another set">

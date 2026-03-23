@@ -14,6 +14,25 @@ export async function fetchExercises() {
   return data;
 }
 
+/**
+ * Create a new exercise in the catalog.
+ */
+export async function createExercise(userId, name, primaryMuscle) {
+  const slug = name.trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+  const { data, error } = await supabase
+    .from('exercises')
+    .insert({
+      name: name.trim(),
+      slug,
+      primary_muscle: primaryMuscle || null,
+      created_by: userId,
+    })
+    .select('id, name, slug, primary_muscle, secondary_muscles, equipment, movement_pattern, exercise_type, difficulty, is_unilateral')
+    .single();
+  if (error) throw error;
+  return data;
+}
+
 // ─── Exercise Logs ──────────────────────────────────────────
 
 /**
@@ -111,7 +130,7 @@ export async function deleteWorkoutLog(id) {
 export async function fetchAllUserLogs(userId) {
   const { data, error } = await supabase
     .from('exercise_logs')
-    .select('date, exercise_id, weight_kg, reps')
+    .select('date, exercise_id, weight_kg, reps, created_at')
     .eq('user_id', userId)
     .order('date');
   if (error) throw error;
@@ -181,27 +200,28 @@ export async function fetchTemplates(userId) {
       template_exercises (
         id,
         exercise_id,
-        sort_order
+        sort_order,
+        sets
       )
     `)
     .eq('user_id', userId)
     .order('created_at');
   if (error) throw error;
-  // Normalize: extract exerciseIds sorted by sort_order
-  return data.map(t => ({
-    id: t.id,
-    name: t.name,
-    exerciseIds: (t.template_exercises || [])
-      .sort((a, b) => a.sort_order - b.sort_order)
-      .map(te => te.exercise_id),
-  }));
+  return data.map(t => {
+    const sorted = (t.template_exercises || []).sort((a, b) => a.sort_order - b.sort_order);
+    return {
+      id: t.id,
+      name: t.name,
+      exercises: sorted.map(te => ({ exerciseId: te.exercise_id, sets: te.sets || 3 })),
+      exerciseIds: sorted.map(te => te.exercise_id),
+    };
+  });
 }
 
 /**
  * Create a new workout template with its exercises.
  */
-export async function createTemplate(userId, name, exerciseIds) {
-  // Create the template
+export async function createTemplate(userId, name, exerciseData) {
   const { data: template, error: tErr } = await supabase
     .from('workout_templates')
     .insert({ user_id: userId, name })
@@ -209,46 +229,51 @@ export async function createTemplate(userId, name, exerciseIds) {
     .single();
   if (tErr) throw tErr;
 
-  // Create the template exercises
-  if (exerciseIds.length > 0) {
-    const rows = exerciseIds.map((exId, idx) => ({
-      template_id: template.id,
-      exercise_id: exId,
-      sort_order: idx,
-    }));
+  if (exerciseData.length > 0) {
+    const rows = exerciseData.map((item, idx) => {
+      const isObj = typeof item === 'object';
+      return {
+        template_id: template.id,
+        exercise_id: isObj ? item.exerciseId : item,
+        sort_order: idx,
+        sets: isObj ? (item.sets || 3) : 3,
+      };
+    });
     const { error: teErr } = await supabase
       .from('template_exercises')
       .insert(rows);
     if (teErr) throw teErr;
   }
 
-  return { ...template, exerciseIds };
+  return template;
 }
 
 /**
  * Update a template's name and exercises.
  */
-export async function updateTemplate(templateId, name, exerciseIds) {
-  // Update name
+export async function updateTemplate(templateId, name, exerciseData) {
   const { error: tErr } = await supabase
     .from('workout_templates')
     .update({ name })
     .eq('id', templateId);
   if (tErr) throw tErr;
 
-  // Replace exercises: delete old, insert new
   const { error: delErr } = await supabase
     .from('template_exercises')
     .delete()
     .eq('template_id', templateId);
   if (delErr) throw delErr;
 
-  if (exerciseIds.length > 0) {
-    const rows = exerciseIds.map((exId, idx) => ({
-      template_id: templateId,
-      exercise_id: exId,
-      sort_order: idx,
-    }));
+  if (exerciseData.length > 0) {
+    const rows = exerciseData.map((item, idx) => {
+      const isObj = typeof item === 'object';
+      return {
+        template_id: templateId,
+        exercise_id: isObj ? item.exerciseId : item,
+        sort_order: idx,
+        sets: isObj ? (item.sets || 3) : 3,
+      };
+    });
     const { error: teErr } = await supabase
       .from('template_exercises')
       .insert(rows);
