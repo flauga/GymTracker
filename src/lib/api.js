@@ -81,8 +81,9 @@ export async function fetchWorkoutsForDate(userId, date) {
 
 /**
  * Create a single workout log entry.
+ * mesoParams is optional: { targetWeight, targetReps, rirTarget, setStatus, mesoWeek }
  */
-export async function createWorkoutLog(userId, exerciseId, date, weightKg, reps) {
+export async function createWorkoutLog(userId, exerciseId, date, weightKg, reps, mesoParams = {}) {
   const { data, error } = await supabase
     .from('exercise_logs')
     .insert({
@@ -92,6 +93,11 @@ export async function createWorkoutLog(userId, exerciseId, date, weightKg, reps)
       weight_kg: weightKg,
       reps,
       sets: 1,
+      ...(mesoParams.targetWeight != null && { target_weight: mesoParams.targetWeight }),
+      ...(mesoParams.targetReps != null && { target_reps: mesoParams.targetReps }),
+      ...(mesoParams.rirTarget != null && { rir_target: mesoParams.rirTarget }),
+      ...(mesoParams.setStatus != null && { set_status: mesoParams.setStatus }),
+      ...(mesoParams.mesoWeek != null && { meso_week: mesoParams.mesoWeek }),
     })
     .select()
     .single();
@@ -362,4 +368,88 @@ export async function deleteProteinLog(id) {
     .delete()
     .eq('id', id);
   if (error) throw error;
+}
+
+// ─── Mesocycle API ─────────────────────────────────────────
+
+/**
+ * Create a new mesocycle.
+ */
+export async function createMesocycle(userId, name, numWeeks, startDate, rirSchedule) {
+  const { data, error } = await supabase
+    .from('mesocycles')
+    .insert({
+      user_id: userId,
+      name,
+      num_weeks: numWeeks,
+      start_date: startDate,
+      rir_schedule: rirSchedule,
+      status: 'active',
+    })
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Fetch the active mesocycle for a user, plus its day schedule.
+ * Returns { meso, schedule } or null if none active.
+ */
+export async function fetchActiveMesocycle(userId) {
+  const { data: meso, error } = await supabase
+    .from('mesocycles')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('status', 'active')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  if (!meso) return null;
+
+  const { data: schedule, error: schedErr } = await supabase
+    .from('meso_schedule')
+    .select('day_of_week, template_id')
+    .eq('mesocycle_id', meso.id);
+  if (schedErr) throw schedErr;
+
+  return { meso, schedule: schedule || [] };
+}
+
+/**
+ * Save day-of-week → template mappings for a meso (full replace).
+ * entries: [{ day_of_week, template_id }]
+ */
+export async function setMesoSchedule(mesocycleId, entries) {
+  // Delete existing
+  await supabase.from('meso_schedule').delete().eq('mesocycle_id', mesocycleId);
+  if (!entries.length) return;
+  const rows = entries.map(e => ({ mesocycle_id: mesocycleId, ...e }));
+  const { error } = await supabase.from('meso_schedule').insert(rows);
+  if (error) throw error;
+}
+
+/**
+ * Update mesocycle status (complete / deload / cancel).
+ */
+export async function updateMesocycleStatus(mesoId, status) {
+  const { error } = await supabase
+    .from('mesocycles')
+    .update({ status })
+    .eq('id', mesoId);
+  if (error) throw error;
+}
+
+/**
+ * Fetch all mesocycles for a user (for history view).
+ */
+export async function fetchAllMesocycles(userId) {
+  const { data, error } = await supabase
+    .from('mesocycles')
+    .select('*')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return data || [];
 }

@@ -143,6 +143,27 @@ const WorkoutApp = () => {
   // Template progression expansion
   const [expandedTemplateId, setExpandedTemplateId] = useState(null);
 
+  // ─── Mesocycle State ───────────────────────────────────
+  const [activeMeso, setActiveMeso] = useState(null);
+  // { id, name, num_weeks, start_date, rir_schedule: number[], status }
+  const [mesoSchedule, setMesoScheduleState] = useState([]);
+  // [{ day_of_week: 0-6, template_id: UUID }]
+  const [mesoSetupStep, setMesoSetupStep] = useState(null);
+  // null | 'config' | 'split' | 'week1'
+  const [mesoName, setMesoName] = useState('');
+  const [mesoNumWeeks, setMesoNumWeeks] = useState(8);
+  const [mesoStartDate, setMesoStartDate] = useState('');
+  const [mesoDraftSchedule, setMesoDraftSchedule] = useState({});
+  // { [dayOfWeek]: templateId | 'rest' }
+  const [mesoWeek1Weights, setMesoWeek1Weights] = useState({});
+  // { [exerciseId]: { weight: string, reps: string } }
+  const [mesoExerciseTargets, setMesoExerciseTargets] = useState({});
+  // { [exerciseId]: { targetWeight, targetReps, rirTarget } }
+  const [setStatusLog, setSetStatusLog] = useState([]);
+  // [{ exerciseId, setNum, status: 'met'|'exceeded'|'missed' }]
+  const [mesoSaving, setMesoSaving] = useState(false);
+  const [allMesocycles, setAllMesocycles] = useState([]);
+
   // Progress Report state
   const [progressAllLogs, setProgressAllLogs] = useState([]);
   const [progressMode, setProgressMode] = useState('big6'); // 'big6' | 'muscleGroup' | 'workout' | 'search'
@@ -315,9 +336,24 @@ const WorkoutApp = () => {
       });
     }
 
+    // Meso: compute set status and record it
+    const mesoTarget = activeMeso ? mesoExerciseTargets[selectedExercise] : null;
+    const setStatus = determineSetStatus(newWeight, newReps, mesoTarget);
+    if (setStatus) {
+      const setNum = (activeWorkoutSetsLogged[selectedExercise] || 0) + 1;
+      setSetStatusLog(prev => [...prev, { exerciseId: selectedExercise, setNum, status: setStatus }]);
+    }
+
     // ── Server sync (background) ──
+    const mesoWeekNum = activeMeso ? computeCurrentMesoWeek(activeMeso) : null;
     try {
-      const result = await api.createWorkoutLog(user.id, selectedExercise, today, newWeight, newReps);
+      const result = await api.createWorkoutLog(user.id, selectedExercise, today, newWeight, newReps, {
+        targetWeight: mesoTarget?.targetWeight,
+        targetReps: mesoTarget?.targetReps,
+        rirTarget: mesoTarget?.rirTarget,
+        setStatus,
+        mesoWeek: mesoWeekNum,
+      });
 
       // PR detection
       const new1RM = compute1RM(newWeight, newReps);
@@ -902,6 +938,151 @@ const WorkoutApp = () => {
     return eqReps >= 1 && eqReps <= 30 ? eqReps : null;
   };
 
+  // ─── Mesocycle Logic ──────────────────────────────────
+
+  const fmtDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+  const buildRirSchedule = (numWeeks) => {
+    // Week 1 = 3 RIR (manual setup). Last = 0 (AMRAP). Second-to-last = 1. Rest = 2.
+    const s = new Array(numWeeks).fill(2);
+    s[0] = 3;
+    s[numWeeks - 1] = 0;
+    if (numWeeks >= 2) s[numWeeks - 2] = 1;
+    return s;
+  };
+
+  const computeCurrentMesoWeek = (meso) => {
+    if (!meso) return 1;
+    const start = new Date(meso.start_date);
+    const today = new Date();
+    const diff = Math.floor((today - start) / (7 * 24 * 60 * 60 * 1000));
+    return Math.max(1, Math.min(diff + 1, meso.num_weeks));
+  };
+
+  const computeWeeklyTarget = (exerciseId, currentWeek, meso, minReps = 10, maxReps = 15) => {
+    if (!meso || currentWeek <= 1) return null;
+    const rirSchedule = meso.rir_schedule;
+    const mesoStart = new Date(meso.start_date);
+
+    const prevWeekStart = new Date(mesoStart);
+    prevWeekStart.setDate(mesoStart.getDate() + (currentWeek - 2) * 7);
+    const prevWeekEnd = new Date(prevWeekStart);
+    prevWeekEnd.setDate(prevWeekStart.getDate() + 6);
+    const psStr = fmtDate(prevWeekStart);
+    const peStr = fmtDate(prevWeekEnd);
+
+    const prevLogs = (overloadCacheRef.current || []).filter(r =>
+      r.exercise_id === exerciseId && r.date >= psStr && r.date <= peStr
+    );
+    if (!prevLogs.length) return null;
+
+    const best = prevLogs.reduce((b, l) => {
+      const orm = compute1RM(l.weight_kg, l.reps) || 0;
+      return orm > (compute1RM(b.weight_kg, b.reps) || 0) ? l : b;
+    }, prevLogs[0]);
+
+    let targetWeight = best.weight_kg || 0;
+    let targetReps = (best.reps || 0) + 1;
+
+    if (targetReps > maxReps) {
+      const nextWeight = Math.ceil(targetWeight * 1.025 * 2) / 2;
+      const eqReps = computeEquivalentReps(targetWeight, targetReps, nextWeight);
+      if (eqReps && eqReps >= 7) {
+        targetWeight = nextWeight;
+        targetReps = Math.max(7, eqReps);
+      }
+    }
+
+    const rirTarget = rirSchedule[currentWeek - 1] ?? 2;
+    return { targetWeight, targetReps: Math.min(targetReps, 28), rirTarget };
+  };
+
+  const determineSetStatus = (actualWeight, actualReps, target) => {
+    if (!target) return null;
+    const { targetWeight, targetReps } = target;
+    if (actualWeight < targetWeight) return 'missed';
+    if (actualReps >= targetReps + 2 || actualWeight > targetWeight) return 'exceeded';
+    if (actualReps >= targetReps - 1) return 'met';
+    return 'missed';
+  };
+
+  const computeNextWorkout = (meso, schedule, templates) => {
+    if (!meso || !schedule || schedule.length === 0) return null;
+    const todayDow = new Date().getDay();
+    for (let i = 1; i <= 7; i++) {
+      const day = (todayDow + i) % 7;
+      const entry = schedule.find(s => s.day_of_week === day);
+      if (entry?.template_id) {
+        const template = (templates || workoutTemplates).find(t => t.id === entry.template_id);
+        if (!template) continue;
+        const d = new Date();
+        d.setDate(d.getDate() + i);
+        return { template, dayOffset: i, date: fmtDate(d) };
+      }
+    }
+    return null;
+  };
+
+  const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const dayNamesShort = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  const getNextMonday = () => {
+    const d = new Date();
+    const day = d.getDay();
+    const toMonday = day === 0 ? 1 : 8 - day;
+    d.setDate(d.getDate() + toMonday);
+    return fmtDate(d);
+  };
+
+  const startMesoWorkout = (template) => {
+    const meso = activeMeso;
+    if (meso) {
+      const week = computeCurrentMesoWeek(meso);
+      const targets = {};
+      (template.exerciseIds || []).forEach(exId => {
+        targets[exId] = computeWeeklyTarget(exId, week, meso);
+      });
+      setMesoExerciseTargets(targets);
+      setSetStatusLog([]);
+    } else {
+      setMesoExerciseTargets({});
+      setSetStatusLog([]);
+    }
+    setActiveTemplate(template);
+    setActiveExerciseIndex(0);
+    setSelectedExercise(template.exerciseIds[0]);
+    const last = lastUsedWeights[template.exerciseIds[0]];
+    setWeight(last ? String(last.weight) : '');
+    setReps(last ? String(last.reps) : '');
+    setActiveWorkoutSetsLogged({});
+    setDashboardView('activeWorkout');
+  };
+
+  const saveMesocycle = async () => {
+    if (!mesoName.trim()) { showToast('error', 'Enter a meso name'); return; }
+    setMesoSaving(true);
+    try {
+      const rirSchedule = buildRirSchedule(mesoNumWeeks);
+      const meso = await api.createMesocycle(user.id, mesoName.trim(), mesoNumWeeks, mesoStartDate || getNextMonday(), rirSchedule);
+      const scheduleEntries = Object.entries(mesoDraftSchedule)
+        .filter(([, val]) => val && val !== 'rest')
+        .map(([dow, templateId]) => ({ day_of_week: parseInt(dow), template_id: templateId }));
+      await api.setMesoSchedule(meso.id, scheduleEntries);
+      setActiveMeso(meso);
+      setMesoScheduleState(scheduleEntries);
+      setMesoSetupStep(null);
+      setMesoDraftSchedule({});
+      setMesoName('');
+      setMesoNumWeeks(8);
+      showToast('success', `Mesocycle "${meso.name}" started!`);
+      setDashboardView('main');
+    } catch (err) {
+      showToast('error', 'Failed to save mesocycle');
+    } finally {
+      setMesoSaving(false);
+    }
+  };
+
   const getMonthlyBest = (exerciseId) => {
     const byMonth = {};
     progressAllLogs
@@ -1187,7 +1368,7 @@ const WorkoutApp = () => {
 
       // Restore dashboard view from localStorage
       const savedView = localStorage.getItem('gymtracker_dashboardView');
-      if (savedView && ['main', 'myWorkouts', 'settings', 'progressReport'].includes(savedView)) {
+      if (savedView && ['main', 'myWorkouts', 'settings', 'progressReport', 'mesocycle'].includes(savedView)) {
         setDashboardView(savedView);
       }
 
@@ -1225,6 +1406,13 @@ const WorkoutApp = () => {
         const saved = localStorage.getItem('gymtracker_weightStacks');
         if (saved) setWeightStacks(JSON.parse(saved));
       } catch (e) {}
+      // Load active mesocycle
+      api.fetchActiveMesocycle(user.id).then(result => {
+        if (result) {
+          setActiveMeso(result.meso);
+          setMesoScheduleState(result.schedule || []);
+        }
+      }).catch(() => {});
       // Weekly summary
       computeWeeklySummary();
       // Load profile data for Slack status
@@ -1460,6 +1648,22 @@ const WorkoutApp = () => {
                       My Workouts
                     </button>
                     <button
+                      onClick={() => setDashboardView(dashboardView === 'mesocycle' ? 'main' : 'mesocycle')}
+                      className={`flex items-center gap-2 px-4 py-2 rounded-lg font-semibold transition border ${
+                        dashboardView === 'mesocycle'
+                          ? 'bg-yellow-500 text-gray-900 border-yellow-500'
+                          : 'bg-gray-800 hover:bg-gray-700 border-gray-700'
+                      }`}
+                    >
+                      <TrendingUp className="w-5 h-5" />
+                      Meso
+                      {activeMeso && (
+                        <span className={`text-xs px-1.5 py-0.5 rounded-full font-bold ${
+                          dashboardView === 'mesocycle' ? 'bg-gray-900/30 text-gray-900' : 'bg-yellow-500/20 text-yellow-400'
+                        }`}>W{computeCurrentMesoWeek(activeMeso)}</span>
+                      )}
+                    </button>
+                    <button
                       onClick={() => setDashboardView(dashboardView === 'settings' ? 'main' : 'settings')}
                       className={`flex items-center gap-2 px-3 py-2 rounded-lg font-semibold transition border ${
                         dashboardView === 'settings'
@@ -1488,6 +1692,79 @@ const WorkoutApp = () => {
           {/* ── Weekly Summary + Repeat Last Workout ────── */}
           {dashboardView === 'main' && (
             <div className="max-w-7xl mx-auto mb-6 space-y-3">
+
+              {/* Meso Status Bar */}
+              {activeMeso && (() => {
+                const week = computeCurrentMesoWeek(activeMeso);
+                const rir = (activeMeso.rir_schedule || [])[week - 1] ?? 2;
+                const nextW = computeNextWorkout(activeMeso, mesoSchedule, workoutTemplates);
+                return (
+                  <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl px-5 py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex items-center gap-3">
+                        <Dumbbell className="w-5 h-5 text-yellow-400 flex-shrink-0" />
+                        <div>
+                          <span className="font-bold text-yellow-400">{activeMeso.name}</span>
+                          <span className="text-gray-400 text-sm ml-3">Week {week} of {activeMeso.num_weeks}</span>
+                          <span className={`ml-3 text-xs px-2 py-0.5 rounded-full font-semibold ${
+                            rir === 3 ? 'bg-orange-500/20 text-orange-400' :
+                            rir === 2 ? 'bg-yellow-500/20 text-yellow-400' :
+                            rir === 1 ? 'bg-lime-500/20 text-lime-400' :
+                            'bg-green-500/20 text-green-400'
+                          }`}>{rir === 0 ? 'AMRAP Week' : `${rir} RIR`}</span>
+                        </div>
+                      </div>
+                      <button onClick={() => setDashboardView('mesocycle')}
+                        className="text-xs text-gray-500 hover:text-white transition">
+                        Manage →
+                      </button>
+                    </div>
+                    <div className="mt-2 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                      <div className="h-full bg-yellow-500 rounded-full transition-all"
+                        style={{ width: `${(week / activeMeso.num_weeks) * 100}%` }} />
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Next Workout Card */}
+              {activeMeso && (() => {
+                const week = computeCurrentMesoWeek(activeMeso);
+                const nextW = computeNextWorkout(activeMeso, mesoSchedule, workoutTemplates);
+                if (!nextW) return null;
+                return (
+                  <div className="bg-gray-800 border border-gray-700 rounded-xl px-5 py-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <div>
+                        <span className="text-xs text-gray-500 uppercase tracking-wide font-semibold">Next Session</span>
+                        <h3 className="font-bold text-white text-lg mt-0.5">{nextW.template.name}</h3>
+                        <span className="text-sm text-gray-400">
+                          {nextW.dayOffset === 1 ? 'Tomorrow' : dayNames[(new Date().getDay() + nextW.dayOffset) % 7]}
+                        </span>
+                      </div>
+                      <button onClick={() => startMesoWorkout(nextW.template)}
+                        className="bg-yellow-500 hover:bg-yellow-400 text-gray-900 font-bold px-6 py-2.5 rounded-lg transition flex-shrink-0">
+                        Start
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {nextW.template.exerciseIds.slice(0, 8).map(exId => {
+                        const ex = exercises.find(e => e.id === exId);
+                        const target = computeWeeklyTarget(exId, week, activeMeso);
+                        return (
+                          <span key={exId} className="text-xs bg-gray-900 border border-gray-700 rounded px-2 py-1 text-gray-300">
+                            {ex?.name || '?'}{target ? ` · ${target.targetReps}r@${target.targetWeight}kg` : ''}
+                          </span>
+                        );
+                      })}
+                      {nextW.template.exerciseIds.length > 8 && (
+                        <span className="text-xs text-gray-600 px-2 py-1">+{nextW.template.exerciseIds.length - 8} more</span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
+
               {/* Weekly Summary Dashboard */}
               {weeklySummary && weeklySummary.sets > 0 && (
                 <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl px-5 py-4">
@@ -1914,6 +2191,66 @@ const WorkoutApp = () => {
                       </span>
                     </div>
                   </div>
+                  {/* Meso Target Card */}
+                  {(() => {
+                    const curExId = activeTemplate.exerciseIds[activeExerciseIndex];
+                    const target = mesoExerciseTargets[curExId];
+                    if (!activeMeso || !target) return null;
+                    const week = computeCurrentMesoWeek(activeMeso);
+                    // Find last week best for comparison
+                    const mesoStart = new Date(activeMeso.start_date);
+                    const lwStart = new Date(mesoStart);
+                    lwStart.setDate(mesoStart.getDate() + (week - 2) * 7);
+                    const lwEnd = new Date(lwStart);
+                    lwEnd.setDate(lwStart.getDate() + 6);
+                    const lwLogs = (overloadCacheRef.current || []).filter(r =>
+                      r.exercise_id === curExId && r.date >= fmtDate(lwStart) && r.date <= fmtDate(lwEnd)
+                    );
+                    const lwBest = lwLogs.length ? lwLogs.reduce((b, l) =>
+                      (compute1RM(l.weight_kg, l.reps) || 0) > (compute1RM(b.weight_kg, b.reps) || 0) ? l : b
+                    , lwLogs[0]) : null;
+                    return (
+                      <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg px-4 py-3 space-y-1">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-blue-400 font-semibold uppercase tracking-wide">
+                            Week {week} Target · {target.rirTarget === 0 ? 'AMRAP' : `${target.rirTarget} RIR`}
+                          </span>
+                          <button type="button"
+                            onClick={() => { setWeight(String(target.targetWeight)); setReps(String(target.targetReps)); }}
+                            className="text-xs text-blue-400 hover:text-blue-300 underline transition">
+                            Use target
+                          </button>
+                        </div>
+                        <div className="text-white font-bold text-base">
+                          {target.targetReps} reps @ {target.targetWeight}kg
+                        </div>
+                        {lwBest && (
+                          <div className="text-xs text-gray-500">
+                            Last week: {lwBest.reps} reps @ {lwBest.weight_kg}kg
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+                  {/* Set Status Log */}
+                  {activeMeso && (() => {
+                    const curExId = activeTemplate.exerciseIds[activeExerciseIndex];
+                    const logs = setStatusLog.filter(s => s.exerciseId === curExId);
+                    if (!logs.length) return null;
+                    return (
+                      <div className="flex gap-2 flex-wrap">
+                        {logs.map((s, i) => (
+                          <span key={i} className={`text-xs font-semibold px-2 py-1 rounded-full ${
+                            s.status === 'exceeded' ? 'bg-yellow-500/15 text-yellow-400' :
+                            s.status === 'met' ? 'bg-green-500/15 text-green-400' :
+                            'bg-red-500/15 text-red-400'
+                          }`}>
+                            {s.status === 'exceeded' ? '↑ Exceeded' : s.status === 'met' ? '✓ Met' : '✗ Missed'} (Set {s.setNum})
+                          </span>
+                        ))}
+                      </div>
+                    );
+                  })()}
                   {/* Double Progression Recommendation */}
                   {(() => {
                     const curExId = activeTemplate.exerciseIds[activeExerciseIndex];
@@ -2299,6 +2636,270 @@ const WorkoutApp = () => {
                   )}
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* ── Mesocycle View ───────────────────────── */}
+          {dashboardView === 'mesocycle' && (
+            <div className="max-w-2xl mx-auto space-y-6">
+              {/* Header */}
+              <div className="flex items-center gap-3">
+                <button onClick={() => { setDashboardView('main'); setMesoSetupStep(null); }}
+                  className="flex items-center gap-1 text-gray-400 hover:text-white transition text-sm">
+                  <ChevronLeft className="w-4 h-4" /> Back
+                </button>
+                <h2 className="text-xl font-bold">Mesocycle</h2>
+              </div>
+
+              {/* Setup Wizard */}
+              {mesoSetupStep && (
+                <div className={cardClass}>
+                  {/* Step indicator */}
+                  <div className="flex items-center gap-2 mb-6">
+                    {['config', 'split', 'week1'].map((step, i) => (
+                      <div key={step} className="flex items-center gap-2">
+                        <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${
+                          mesoSetupStep === step ? 'bg-yellow-500 text-gray-900' : 'bg-gray-700 text-gray-400'
+                        }`}>{i + 1}</span>
+                        <span className={`text-sm ${mesoSetupStep === step ? 'text-white' : 'text-gray-600'}`}>
+                          {step === 'config' ? 'Configure' : step === 'split' ? 'Split' : 'Week 1'}
+                        </span>
+                        {i < 2 && <ChevronRight className="w-3 h-3 text-gray-700" />}
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Step 1: Config */}
+                  {mesoSetupStep === 'config' && (
+                    <div className="space-y-5">
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-400 mb-2">Mesocycle Name</label>
+                        <input type="text" value={mesoName} onChange={e => setMesoName(e.target.value)}
+                          placeholder="e.g. Summer Hypertrophy Block"
+                          className="w-full px-4 py-3 rounded-lg bg-gray-900 border border-gray-700 text-white placeholder-gray-600 focus:outline-none focus:border-yellow-500 transition" />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-400 mb-2">
+                          Number of Weeks: <span className="text-yellow-400">{mesoNumWeeks}</span>
+                        </label>
+                        <input type="range" min="4" max="16" value={mesoNumWeeks}
+                          onChange={e => setMesoNumWeeks(parseInt(e.target.value))}
+                          className="w-full accent-yellow-500" />
+                        <div className="flex justify-between text-xs text-gray-600 mt-1">
+                          <span>4 weeks</span><span>16 weeks</span>
+                        </div>
+                      </div>
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-400 mb-2">Start Date</label>
+                        <input type="date" value={mesoStartDate || getNextMonday()}
+                          onChange={e => setMesoStartDate(e.target.value)}
+                          className="w-full px-4 py-3 rounded-lg bg-gray-900 border border-gray-700 text-white focus:outline-none focus:border-yellow-500 transition" />
+                      </div>
+                      {/* RIR timeline preview */}
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-400 mb-2">RIR Schedule</label>
+                        <div className="flex gap-1 flex-wrap">
+                          {buildRirSchedule(mesoNumWeeks).map((rir, i) => (
+                            <div key={i} className={`flex flex-col items-center gap-0.5`}>
+                              <span className={`px-2 py-1 rounded text-xs font-bold ${
+                                rir === 3 ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30' :
+                                rir === 2 ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30' :
+                                rir === 1 ? 'bg-lime-500/20 text-lime-400 border border-lime-500/30' :
+                                'bg-green-500/20 text-green-400 border border-green-500/30'
+                              }`}>
+                                {rir === 0 ? 'MAX' : `${rir}RIR`}
+                              </span>
+                              <span className="text-[10px] text-gray-600">W{i + 1}</span>
+                            </div>
+                          ))}
+                        </div>
+                        <p className="text-xs text-gray-600 mt-2">Week 1 = conservative start (3 RIR). Intensity builds to max effort.</p>
+                      </div>
+                      <button onClick={() => { if (mesoName.trim()) setMesoSetupStep('split'); else showToast('error', 'Enter a name'); }}
+                        className="w-full bg-yellow-500 hover:bg-yellow-400 text-gray-900 font-bold py-3 rounded-lg transition">
+                        Next: Set Split →
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Step 2: Split */}
+                  {mesoSetupStep === 'split' && (
+                    <div className="space-y-4">
+                      <p className="text-sm text-gray-400">Assign a workout template to each training day. Days left empty are rest days.</p>
+                      {/* Monday-first order: 1,2,3,4,5,6,0 */}
+                      {[1, 2, 3, 4, 5, 6, 0].map(dow => (
+                        <div key={dow} className="flex items-center gap-3">
+                          <span className="text-sm text-gray-400 w-12 flex-shrink-0">{dayNamesShort[dow]}</span>
+                          <select
+                            value={mesoDraftSchedule[dow] || 'rest'}
+                            onChange={e => setMesoDraftSchedule(prev => ({ ...prev, [dow]: e.target.value }))}
+                            className="flex-1 px-3 py-2 rounded-lg bg-gray-900 border border-gray-700 text-white text-sm focus:outline-none focus:border-yellow-500 transition">
+                            <option value="rest">— Rest —</option>
+                            {workoutTemplates.map(t => (
+                              <option key={t.id} value={t.id}>{t.name}</option>
+                            ))}
+                          </select>
+                        </div>
+                      ))}
+                      {workoutTemplates.length === 0 && (
+                        <p className="text-yellow-400 text-sm">No templates found. <button onClick={() => setDashboardView('myWorkouts')} className="underline">Create templates first</button></p>
+                      )}
+                      <div className="flex gap-2 mt-2">
+                        <button onClick={() => setMesoSetupStep('config')}
+                          className="flex-1 bg-gray-700 hover:bg-gray-600 py-3 rounded-lg font-semibold transition">
+                          ← Back
+                        </button>
+                        <button onClick={() => setMesoSetupStep('week1')}
+                          className="flex-1 bg-yellow-500 hover:bg-yellow-400 text-gray-900 font-bold py-3 rounded-lg transition">
+                          Next: Week 1 →
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Step 3: Week 1 starting weights */}
+                  {mesoSetupStep === 'week1' && (
+                    <div className="space-y-4">
+                      <div className="bg-orange-500/10 border border-orange-500/20 rounded-lg px-4 py-3 text-sm text-orange-300">
+                        Set your Week 1 starting weights at <strong>3 RIR</strong> — use a weight you can do 3 reps short of failure. These are logged when you first train each exercise.
+                      </div>
+                      {/* Show exercises grouped by day */}
+                      {[1, 2, 3, 4, 5, 6, 0].map(dow => {
+                        const templateId = mesoDraftSchedule[dow];
+                        if (!templateId || templateId === 'rest') return null;
+                        const template = workoutTemplates.find(t => t.id === templateId);
+                        if (!template) return null;
+                        return (
+                          <div key={dow} className="bg-gray-900 rounded-lg p-4 border border-gray-700">
+                            <h4 className="font-semibold text-yellow-400 mb-3">{dayNamesShort[dow]} — {template.name}</h4>
+                            <div className="space-y-2">
+                              {template.exerciseIds.map(exId => {
+                                const ex = exercises.find(e => e.id === exId);
+                                const w1 = mesoWeek1Weights[exId] || {};
+                                return (
+                                  <div key={exId} className="flex items-center gap-2">
+                                    <span className="text-sm text-gray-300 flex-1">{ex?.name || 'Unknown'}</span>
+                                    <input type="number" step="0.5" placeholder="kg"
+                                      value={w1.weight || lastUsedWeights[exId]?.weight || ''}
+                                      onChange={e => setMesoWeek1Weights(prev => ({ ...prev, [exId]: { ...prev[exId], weight: e.target.value } }))}
+                                      className="w-20 px-2 py-1 rounded bg-gray-800 border border-gray-600 text-white text-sm text-center focus:outline-none focus:border-yellow-500" />
+                                    <span className="text-gray-600 text-xs">×</span>
+                                    <input type="number" placeholder="reps"
+                                      value={w1.reps || lastUsedWeights[exId]?.reps || ''}
+                                      onChange={e => setMesoWeek1Weights(prev => ({ ...prev, [exId]: { ...prev[exId], reps: e.target.value } }))}
+                                      className="w-16 px-2 py-1 rounded bg-gray-800 border border-gray-600 text-white text-sm text-center focus:outline-none focus:border-yellow-500" />
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        );
+                      })}
+                      <div className="flex gap-2">
+                        <button onClick={() => setMesoSetupStep('split')}
+                          className="flex-1 bg-gray-700 hover:bg-gray-600 py-3 rounded-lg font-semibold transition">
+                          ← Back
+                        </button>
+                        <button onClick={saveMesocycle} disabled={mesoSaving}
+                          className="flex-1 bg-green-600 hover:bg-green-500 text-white font-bold py-3 rounded-lg transition disabled:opacity-40">
+                          {mesoSaving ? 'Creating...' : 'Start Mesocycle'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Active Meso Panel */}
+              {!mesoSetupStep && (
+                <>
+                  {activeMeso ? (
+                    <div className={cardClass}>
+                      <div className="flex items-center justify-between mb-4">
+                        <div>
+                          <h3 className="text-lg font-bold text-yellow-400">{activeMeso.name}</h3>
+                          <p className="text-sm text-gray-400">
+                            Week {computeCurrentMesoWeek(activeMeso)} of {activeMeso.num_weeks} ·
+                            Started {activeMeso.start_date}
+                          </p>
+                        </div>
+                        <span className={`text-xs px-3 py-1 rounded-full font-semibold ${
+                          activeMeso.status === 'active' ? 'bg-green-500/15 text-green-400' : 'bg-gray-700 text-gray-400'
+                        }`}>{activeMeso.status}</span>
+                      </div>
+                      {/* Week progress bar */}
+                      <div className="mb-4">
+                        <div className="flex justify-between text-xs text-gray-500 mb-1">
+                          <span>Progress</span>
+                          <span>{computeCurrentMesoWeek(activeMeso)}/{activeMeso.num_weeks} weeks</span>
+                        </div>
+                        <div className="h-2.5 bg-gray-700 rounded-full overflow-hidden">
+                          <div className="h-full bg-yellow-500 rounded-full transition-all"
+                            style={{ width: `${(computeCurrentMesoWeek(activeMeso) / activeMeso.num_weeks) * 100}%` }} />
+                        </div>
+                      </div>
+                      {/* RIR timeline */}
+                      <div className="mb-4">
+                        <div className="text-xs text-gray-500 mb-2">RIR Schedule</div>
+                        <div className="flex gap-1 flex-wrap">
+                          {(activeMeso.rir_schedule || []).map((rir, i) => {
+                            const isCurrent = i === computeCurrentMesoWeek(activeMeso) - 1;
+                            return (
+                              <div key={i} className={`flex flex-col items-center gap-0.5 ${isCurrent ? 'ring-2 ring-yellow-500 rounded' : ''}`}>
+                                <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                  rir === 3 ? 'bg-orange-500/20 text-orange-400' :
+                                  rir === 2 ? 'bg-yellow-500/20 text-yellow-400' :
+                                  rir === 1 ? 'bg-lime-500/20 text-lime-400' :
+                                  'bg-green-500/20 text-green-400'
+                                }`}>{rir === 0 ? 'MAX' : `${rir}R`}</span>
+                                <span className="text-[9px] text-gray-600">W{i + 1}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                      {/* Split summary */}
+                      {mesoSchedule.length > 0 && (
+                        <div className="mb-4">
+                          <div className="text-xs text-gray-500 mb-2">Weekly Split</div>
+                          <div className="grid grid-cols-7 gap-1">
+                            {[1, 2, 3, 4, 5, 6, 0].map(dow => {
+                              const entry = mesoSchedule.find(s => s.day_of_week === dow);
+                              const template = entry?.template_id ? workoutTemplates.find(t => t.id === entry.template_id) : null;
+                              return (
+                                <div key={dow} className={`text-center p-1 rounded text-[10px] ${template ? 'bg-yellow-500/10 text-yellow-300' : 'bg-gray-900 text-gray-600'}`}>
+                                  <div className="font-bold">{dayNamesShort[dow]}</div>
+                                  <div className="truncate">{template ? template.name.slice(0, 4) : '—'}</div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                      <div className="flex gap-2">
+                        <button onClick={() => api.updateMesocycleStatus(activeMeso.id, 'completed').then(() => { setActiveMeso(null); setMesoScheduleState([]); showToast('success', 'Meso completed!'); }).catch(() => showToast('error', 'Failed'))}
+                          className="flex-1 bg-green-600 hover:bg-green-500 text-white font-bold py-2.5 rounded-lg transition text-sm">
+                          Complete Meso
+                        </button>
+                        <button onClick={() => api.updateMesocycleStatus(activeMeso.id, 'cancelled').then(() => { setActiveMeso(null); setMesoScheduleState([]); showToast('success', 'Meso cancelled'); }).catch(() => showToast('error', 'Failed'))}
+                          className="flex-1 bg-gray-700 hover:bg-gray-600 py-2.5 rounded-lg transition text-sm">
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className={cardClass + ' text-center py-10'}>
+                      <Dumbbell className="w-12 h-12 text-gray-600 mx-auto mb-4" />
+                      <h3 className="text-lg font-semibold mb-2">No Active Mesocycle</h3>
+                      <p className="text-gray-500 text-sm mb-6">Set up a structured training block with weekly RIR progression and automatic target calculations.</p>
+                      <button onClick={() => { setMesoSetupStep('config'); setMesoStartDate(getNextMonday()); }}
+                        className="bg-yellow-500 hover:bg-yellow-400 text-gray-900 font-bold px-8 py-3 rounded-lg transition">
+                        Create Mesocycle
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           )}
 
